@@ -8,7 +8,7 @@
 import * as vscode from 'vscode';
 import * as path   from 'path';
 import * as fs     from 'fs';
-import { GraphNode, GraphEdge, GtagEntry, ScopeEntry, ScopeMapEntry } from './types';
+import { GraphNode, GraphEdge, ScopeEntry, ScopeMapEntry } from './types';
 import { cache } from './cacheManager';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,6 +27,29 @@ export const CC_CALLEE_EXTENSIONS  = new Set([
   '.c', '.cc', '.cpp', '.cxx', '.c++',
   '.h', '.hh', '.hpp', '.hxx', '.h++',
   '.inl', '.ipp', '.tpp', '.tcc',
+  // B4修正: CC_SOURCE_EXTENSIONS(解析対象として選択できるファイル)には .cu/.cuh が
+  // 含まれるが、こちらに無かったため、CUDAファイル内の関数がコールグラフのcallee側
+  // (LSPバックエンドの shouldIncludeCallee)として一切拾われず、エッジが消えていた。
+  '.cu', '.cuh',
+]);
+
+/**
+ * 解析・変更検知の対象から除外するディレクトリ名。
+ * extension.ts のファイルウォッチャー(isExcludedPath)と、gtagsBackend.ts の
+ * candidateRank(N1: 同名候補の距離判定で除外ディレクトリ配下の候補を後回しにする)
+ * で共有する。両者で別々に定義すると片方だけ更新されるリスクがあるため一元化した。
+ */
+export const EXCLUDE_DIRS = new Set([
+  // 共通
+  'node_modules', 'build', 'dist', 'out', '.git',
+  // CMake 系
+  'CMakeFiles', '_build', '_deps', 'cmake-build-debug', 'cmake-build-release',
+  // ツール系
+  '.cache', '.ccls-cache', 'vendor', '.deps',
+  // Python 系 (C/C++ プロジェクトに Python ビルドスクリプト等が同居するケース用。
+  // 以前は gtagsBackend.ts の EXCLUDE_GLOB にのみ個別定義されており、こちらの
+  // isExcludedPath / candidateRank 側には反映されていなかった)
+  '__pycache__', '.venv', '.mypy_cache',
 ]);
 
 export const BATCH_SIZE           = 6;
@@ -41,7 +64,12 @@ export const CANCELED_RETRY_DELAY = 3000;
 
 export function normalizeFsPath(p: string): string {
   const n = path.normalize(p);
-  return process.platform === 'win32' ? n.toLowerCase() : n;
+  // #2修正: 以前は win32 のみを大文字小文字非依存として扱っていたが、macOS(darwin)の
+  // 標準ファイルシステム(APFS/HFS+)も既定で大文字小文字を区別しない。
+  // webviewPanel.ts の resolveAndNormalize、および本ファイル内 getScopeIndex の
+  // 「非linux小文字索引」フォールバックはすでに darwin も対象にしており、
+  // ここだけ win32 限定になっていた不整合を解消する。
+  return process.platform !== 'linux' ? n.toLowerCase() : n;
 }
 
 export function splitEdges(edgeSet: Set<string>): GraphEdge[] {
@@ -83,6 +111,14 @@ export function isCanceledByClangd(err: unknown): boolean {
   return !(err instanceof vscode.CancellationError) && String(err).includes('Canceled');
 }
 
+// VS Code がコマンド自体未登録の場合に投げるエラーメッセージの形式は `command '<id>' not found`
+// (例: "Error: command 'vscode.provideOutgoingCalls' not found")。
+// 単純に 'not found' という部分文字列だけで判定すると、clangd/cpptools がインデックス未完了時に
+// 返す一時的なエラー(例: "symbol not found" 系の文言)まで巻き込んで即座に諦めてしまい、
+// 本来リトライで解決したはずの一時的な失敗を悪化させてしまう。
+// そのため「command '...' not found」という構造そのものにマッチする場合のみ早期に諦める。
+const COMMAND_NOT_FOUND_RE = /\bcommand\s+'[^']*'\s+not found\b/i;
+
 export async function execWithRetry<T>(
   command: string,
   token:   vscode.CancellationToken | undefined,
@@ -94,7 +130,7 @@ export async function execWithRetry<T>(
       return await vscode.commands.executeCommand<T>(command, ...args);
     } catch (err) {
       if (err instanceof vscode.CancellationError) throw err;
-      if (String(err).includes('not found')) throw err;
+      if (COMMAND_NOT_FOUND_RE.test(String(err))) throw err;
       if (i < MAX_RETRY - 1) { await delay(RETRY_BASE_MS * Math.pow(2, i)); continue; }
       throw err;
     }
@@ -130,21 +166,50 @@ export function hasCppSourceExtension(uri: vscode.Uri): boolean {
 // スコープ検索 (WeakMap キャッシュ付き O(1) 大文字小文字無視)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const lowerScopeIndexCache = new WeakMap<
-  Map<string, ScopeMapEntry>,
-  Map<string, ScopeMapEntry>
->();
+// N9修正: 以前は「見つからない」場合に scopeMap の全キーを線形走査して
+// normalizeFsPath をかけていたため、関数定義を持たないファイル(代表例: ヘッダ。
+// 外部リンケージ関数のプロトタイプ参照のたびにこの経路を通る)に対する検索が
+// ファイル数に比例して遅くなっていた(数千ファイル規模で顕著)。
+// scopeMap の変更検知用バージョンカウンタ。
+// getScopeIndex() は size の一致だけでキャッシュ有効性を判定していたが、
+// 理論上「N件削除してN件追加」のような size 不変の変更があると stale なインデックスを
+// 使い続けてしまう(現状は scopeMap 系はすべて追加専用のため実害はないが、将来の変更に対する
+// 防御として、変更のたびに touchScopeMap() を呼んでもらうことでバージョンも照合する)。
+// touchScopeMap() が呼ばれない場合は従来通り size のみでの判定にフォールバックするため、
+// 呼び出し忘れがあっても現状より悪化することはない。
+const scopeMapVersions = new WeakMap<Map<string, ScopeMapEntry>, number>();
 
-function getLowerScopeIndex(scopeMap: Map<string, ScopeMapEntry>): Map<string, ScopeMapEntry> {
-  const cached = lowerScopeIndexCache.get(scopeMap);
-  if (cached) return cached;
-  const lower = new Map<string, ScopeMapEntry>();
+/** scopeMap への .set()/削除等の変更後に呼び出し、getScopeIndex() のキャッシュを無効化する。 */
+export function touchScopeMap(scopeMap: Map<string, ScopeMapEntry>): void {
+  scopeMapVersions.set(scopeMap, (scopeMapVersions.get(scopeMap) ?? 0) + 1);
+}
+
+// 正規化済みキーの索引を scopeMap ごとに1回だけ構築し、以降は O(1) で引く。
+// 「無い」と確定したパスも missing に記録して線形走査を再度走らせない。
+// #2修正: normalizeFsPath が非linux(win32/darwin)で既に小文字化するようになったため、
+// ここで別途 toLowerCase() していた「非linux小文字索引」フォールバックは不要になった
+// (normalizeFsPath の結果がそのまま既に小文字なので、旧実装は同じキーを2回setするだけの
+//  無駄な処理になっていた)。索引を1本化して単純化する。
+interface ScopeIndex {
+  size:    number;
+  version: number;
+  byNorm:  Map<string, ScopeMapEntry>;  // normalizeFsPath 済みキー → エントリ
+  missing: Set<string>;                 // 「無い」と確定したパス
+}
+const scopeIndexCache = new WeakMap<Map<string, ScopeMapEntry>, ScopeIndex>();
+
+function getScopeIndex(scopeMap: Map<string, ScopeMapEntry>): ScopeIndex {
+  const currentVersion = scopeMapVersions.get(scopeMap) ?? 0;
+  const cached = scopeIndexCache.get(scopeMap);
+  if (cached && cached.size === scopeMap.size && cached.version === currentVersion) return cached;
+  const byNorm = new Map<string, ScopeMapEntry>();
   for (const [k, v] of scopeMap) {
-    const lk = normalizeFsPath(k).toLowerCase();
-    if (!lower.has(lk)) lower.set(lk, v);
+    const nk = normalizeFsPath(k);
+    if (!byNorm.has(nk)) byNorm.set(nk, v);
   }
-  lowerScopeIndexCache.set(scopeMap, lower);
-  return lower;
+  const idx: ScopeIndex = { size: scopeMap.size, version: currentVersion, byNorm, missing: new Set() };
+  scopeIndexCache.set(scopeMap, idx);
+  return idx;
 }
 
 export function findScopeMapEntry(
@@ -153,24 +218,19 @@ export function findScopeMapEntry(
 ): ScopeMapEntry | undefined {
   let entry = scopeMap.get(filePath);
   if (entry) return entry;
+  const idx  = getScopeIndex(scopeMap);
   const norm = normalizeFsPath(filePath);
-  entry = scopeMap.get(norm);
+  entry = idx.byNorm.get(norm);
   if (entry) return entry;
-  if (process.platform !== 'linux') {
-    entry = getLowerScopeIndex(scopeMap).get(norm.toLowerCase());
-    if (entry) return entry;
-  }
+  if (idx.missing.has(filePath)) return undefined;
   try {
     const real = cache.getRealpath(filePath) ?? (() => {
       const r = fs.realpathSync(filePath); cache.setRealpath(filePath, r); return r;
     })();
-    entry = scopeMap.get(real);
+    entry = scopeMap.get(real) ?? idx.byNorm.get(normalizeFsPath(real));
     if (entry) return entry;
-    const realNorm = normalizeFsPath(real);
-    for (const [k, v] of scopeMap) {
-      if (normalizeFsPath(k) === realNorm) return v;
-    }
   } catch { /* ファイル不存在は無視 */ }
+  idx.missing.add(filePath);
   return undefined;
 }
 
@@ -190,8 +250,12 @@ export function findScopeAtLine(list: ScopeEntry[], refLine: number): ScopeEntry
 // LSP ノード操作ヘルパー
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function makeNodeId(uri: vscode.Uri, name: string, line: number): string {
-  return `${uri.fsPath}\x00${name}\x00${line}`;
+export function normalizeSymbolName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ');
+}
+
+export function makeNodeId(uri: vscode.Uri, name: string): string {
+  return `${uri.fsPath}\x00${normalizeSymbolName(name)}`;
 }
 
 export function baseNameOf(name: string): string {
@@ -214,16 +278,36 @@ export function findExistingCalleeId(
   index: ReadonlyMap<string, string>,
   to:    vscode.CallHierarchyItem,
 ): string | null {
-  const exactId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+  const exactId = makeNodeId(to.uri, to.name);
   if (nodes.has(exactId)) return exactId;
   const base    = baseNameOf(to.name);
   const indexed = index.get(`${to.uri.fsPath}\x00${base}`);
   if (indexed) return indexed;
   const ext = path.extname(to.uri.fsPath).toLowerCase();
-  if (['.h', '.hpp', '.hxx'].includes(ext)) {
+  // Bug修正: CC_CALLEE_EXTENSIONS のヘッダー拡張子(.h/.hh/.hpp/.hxx/.h++)と一致させる。
+  // 以前は .hh/.h++ が抜けており、これらの拡張子のヘッダー経由で同名関数の曖昧さが
+  // 生じた場合に限り、下記の stem一致/候補1件フォールバックが働かず callee が
+  // 解決できずに edge が欠落していた。
+  if (['.h', '.hh', '.hpp', '.hxx', '.h++'].includes(ext)) {
+    // B10修正: 以前は「ラベルが一致する最初のノード」を無条件で採用しており、
+    // 同名の別ファイルの static 関数などへ誤接続する可能性があった
+    // (ヘッダのプロトタイプ経由で inline 関数や複数箇所にある同名シンボルを
+    //  解決しようとした場合等)。
+    // 候補を全て集め、① ヘッダと同じ stem(foo.h ↔ foo.c/.cpp等)を持つ
+    // 候補があればそれを最優先で採用し、② stem一致が無い場合でも
+    // 候補が1件だけ(曖昧さが無い)なら採用する。③ 複数候補があり
+    // stem一致も無い場合は、どれが正しいか判別できないため統合しない。
+    const stem = path.basename(to.uri.fsPath, ext);
+    const candidates: string[] = [];
+    let stemMatch: string | null = null;
     for (const [id, node] of nodes) {
-      if (node.label === base || baseNameOf(node.label) === base) return id;
+      if (node.label === base || baseNameOf(node.label) === base) {
+        candidates.push(id);
+        if (path.basename(node.file, path.extname(node.file)) === stem) stemMatch = id;
+      }
     }
+    if (stemMatch) return stemMatch;
+    if (candidates.length === 1) return candidates[0];
   }
   return null;
 }

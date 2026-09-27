@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import * as path   from 'path';
 import { GraphNode, GraphData } from './types';
 import {
-  BfsResult, mergeBfsResult, lspBfs,
+  mergeBfsResult, lspBfs,
 } from './bfsEngine';
 import {
   Pct, checkCancellation, execWithRetry, isCanceledByClangd,
@@ -18,6 +18,19 @@ import {
   splitEdges, getWorkspaceRoots, hasCppSourceExtension,
   BATCH_SIZE, CANCELED_RETRY_DELAY, delay,
 } from './utils';
+
+function isDefinitionItem(item: vscode.CallHierarchyItem): boolean {
+  return item.range.end.line > item.selectionRange.start.line;
+}
+
+function preferDefinitionItem(
+  current: vscode.CallHierarchyItem | undefined,
+  candidate: vscode.CallHierarchyItem,
+): vscode.CallHierarchyItem {
+  if (!current) return candidate;
+  if (isDefinitionItem(candidate) && !isDefinitionItem(current)) return candidate;
+  return current;
+}
 
 export async function buildFileCallGraphLsp(
   document: vscode.TextDocument,
@@ -45,7 +58,7 @@ export async function buildFileCallGraphLsp(
 
   // コアノードを事前登録
   for (const f of functions) {
-    const id = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
+    const id = makeNodeId(document.uri, f.name);
     const n: GraphNode = {
       id, label: baseNameOf(f.name), labelFull: f.name,
       file: document.uri.fsPath, line: f.selectionRange.start.line + 1,
@@ -57,15 +70,15 @@ export async function buildFileCallGraphLsp(
 
   // prepareCallHierarchy (バッチ並列)
   pct.to(5);
-  const coreItems: Array<[vscode.CallHierarchyItem, string]> = [];
+  const coreItems = new Map<string, vscode.CallHierarchyItem>();
   for (let i = 0; i < functions.length; i += BATCH_SIZE) {
     checkCancellation(token);
     await Promise.all(functions.slice(i, i + BATCH_SIZE).map(async f => {
-      const id = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
+      const id = makeNodeId(document.uri, f.name);
       try {
         const items = await execWithRetry<vscode.CallHierarchyItem[]>(
           'vscode.prepareCallHierarchy', token, document.uri, f.selectionRange.start);
-        if (items?.[0]) coreItems.push([items[0], id]);
+        if (items?.[0]) coreItems.set(id, preferDefinitionItem(coreItems.get(id), items[0]));
       } catch (err) {
         if (err instanceof vscode.CancellationError) throw err;
         errs.push(`(prep) ${f.name}: ${String(err)}`);
@@ -74,19 +87,23 @@ export async function buildFileCallGraphLsp(
     pct.range(5, 20, Math.min(i + BATCH_SIZE, functions.length), functions.length);
   }
 
-  // 下方向 BFS
-  mergeBfsResult({ edgeSet, errs }, await lspBfs({
-    direction: 'outgoing', startItems: coreItems,
-    nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
-    token, pct, pctRange: [20, 55],
-  }));
-
-  // 上方向 BFS (下方向の結果がマージ済みの nodes を knownNodes として引き継ぐ)
-  mergeBfsResult({ edgeSet, errs }, await lspBfs({
-    direction: 'incoming', startItems: coreItems,
-    nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
-    token, pct, pctRange: [55, 100],
-  }));
+  // 発信・着信 BFS を並列実行。
+  // 両者は nodes/nodeIndex を共有するが、ノード登録(has→set)は
+  // await を挟まず同期的に完結しているため競合しない。
+  const [downResult, upResult] = await Promise.all([
+    lspBfs({
+      direction: 'outgoing', startItems: Array.from(coreItems, ([id, item]) => [item, id]),
+      nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
+      token, pct, pctRange: [20, 60],
+    }),
+    lspBfs({
+      direction: 'incoming', startItems: Array.from(coreItems, ([id, item]) => [item, id]),
+      nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
+      token, pct, pctRange: [60, 100],
+    }),
+  ]);
+  mergeBfsResult({ edgeSet, errs }, downResult);
+  mergeBfsResult({ edgeSet, errs }, upResult);
 
   return {
     nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),
@@ -96,7 +113,7 @@ export async function buildFileCallGraphLsp(
 }
 
 export async function buildFunctionCallGraphLsp(
-  document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
+  document: vscode.TextDocument, position: vscode.Position, maxHops: number | undefined,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
@@ -115,7 +132,7 @@ export async function buildFunctionCallGraphLsp(
   const nodes:     Map<string, GraphNode> = new Map();
   const edgeSet:   Set<string>            = new Set();
   const nodeIndex: NodeIndex              = new Map();
-  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name, startItems[0].selectionRange.start.line);
+  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name);
 
   // 下方向 BFS のみ
   mergeBfsResult({ edgeSet, errs }, await lspBfs({
@@ -133,7 +150,7 @@ export async function buildFunctionCallGraphLsp(
 }
 
 export async function buildPathThroughCallGraphLsp(
-  document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
+  document: vscode.TextDocument, position: vscode.Position, maxHops: number | undefined,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
@@ -152,22 +169,24 @@ export async function buildPathThroughCallGraphLsp(
   const nodes:     Map<string, GraphNode> = new Map();
   const edgeSet:   Set<string>            = new Set();
   const nodeIndex: NodeIndex              = new Map();
-  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name, startItems[0].selectionRange.start.line);
+  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name);
   const startEntry: [vscode.CallHierarchyItem, string] = [startItems[0], startNodeId];
 
-  // 下方向 BFS
-  mergeBfsResult({ edgeSet, errs }, await lspBfs({
-    direction: 'outgoing', startItems: [startEntry],
-    nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
-    maxHops, token, pct, pctRange: [5, 50],
-  }));
-
-  // 上方向 BFS (下方向の結果がマージ済みの nodes を引き継ぐ)
-  mergeBfsResult({ edgeSet, errs }, await lspBfs({
-    direction: 'incoming', startItems: [startEntry],
-    nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
-    maxHops, token, pct, pctRange: [50, 100],
-  }));
+  // 発信・着信 BFS を並列実行(理由は buildFileCallGraphLsp と同様)。
+  const [downResult, upResult] = await Promise.all([
+    lspBfs({
+      direction: 'outgoing', startItems: [startEntry],
+      nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
+      maxHops, token, pct, pctRange: [5, 52],
+    }),
+    lspBfs({
+      direction: 'incoming', startItems: [startEntry],
+      nodes, nodeIndex, currentFile: document.uri.fsPath, wsRoots,
+      maxHops, token, pct, pctRange: [52, 100],
+    }),
+  ]);
+  mergeBfsResult({ edgeSet, errs }, downResult);
+  mergeBfsResult({ edgeSet, errs }, upResult);
 
   return {
     nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),
@@ -195,7 +214,7 @@ export async function processWsFileLsp(
   pctRange:  [number, number] = [0, 100],
 ): Promise<vscode.DocumentSymbol[]> {
   const canceledFuncs: vscode.DocumentSymbol[] = [];
-  const startItems: Array<[vscode.CallHierarchyItem, string]> = [];
+  const startItems = new Map<string, vscode.CallHierarchyItem>();
 
   for (let i = 0; i < functions.length; i += BATCH_SIZE) {
     checkCancellation(token);
@@ -204,7 +223,8 @@ export async function processWsFileLsp(
         const items = await execWithRetry<vscode.CallHierarchyItem[]>(
           'vscode.prepareCallHierarchy', token, uri, f.selectionRange.start);
         if (items?.[0]) {
-          startItems.push([items[0], makeNodeId(uri, f.name, f.selectionRange.start.line)]);
+          const id = makeNodeId(uri, f.name);
+          startItems.set(id, preferDefinitionItem(startItems.get(id), items[0]));
         }
       } catch (err) {
         if (err instanceof vscode.CancellationError) throw err;
@@ -214,9 +234,10 @@ export async function processWsFileLsp(
     }));
   }
 
-  if (startItems.length > 0) {
+  if (startItems.size > 0) {
     mergeBfsResult({ edgeSet, errs }, await lspBfs({
-      direction: 'outgoing', startItems,
+      direction: 'outgoing',
+      startItems: Array.from(startItems, ([id, item]) => [item, id]),
       nodes, nodeIndex,
       currentFile: uri.fsPath, wsRoots,
       maxHops: 1, token, pct, pctRange,
@@ -257,7 +278,7 @@ export async function buildWorkspaceCallGraphLsp(
       if (!rawSyms?.length) return;
       const functions = flattenFunctions(rawSyms);
       for (const f of functions) {
-        const id = makeNodeId(uri, f.name, f.selectionRange.start.line);
+        const id = makeNodeId(uri, f.name);
         if (!nodes.has(id)) {
           const n: GraphNode = {
             id, label: baseNameOf(f.name), labelFull: f.name,

@@ -3,10 +3,10 @@
   "displayName": "Call Atlas",
   "publisher": "uta-orange-1214",
   "description": "Interactive C/C++ call graph viewer using LSP Call Hierarchy or GNU GLOBAL (gtags). / LSP または GNU GLOBAL (gtags) を使った C/C++ インタラクティブコールグラフビューア。",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "repository": {
     "type": "git",
-    "url": "https://github.com/uta1214/call-atlas"
+    "url": "git+https://github.com/uta1214/call-atlas.git"
   },
   "icon": "icon.png",
   "keywords": [
@@ -24,6 +24,19 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Call Atlas needs a real file system and local tools (language server / GNU GLOBAL). / 実ファイルシステムとローカルツール（言語サーバー / GNU GLOBAL）が必要です。"
+    },
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Call Atlas runs external commands (gtags/global) and writes GTAGS/GRTAGS/GPATH into the workspace. / gtags/globalなど外部コマンドを実行し、ワークスペースにGTAGS/GRTAGS/GPATHを書き込むため。"
+    }
+  },
   "categories": [
     "Visualization",
     "Programming Languages"
@@ -35,18 +48,17 @@
   ],
   "main": "./dist/extension.js",
   "scripts": {
-    "compile": "node esbuild.js",
+    "typecheck": "tsc --noEmit",
+    "compile": "npm run typecheck && node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "vscode:prepublish": "node esbuild.js --production"
-  },
-  "dependencies": {
-    "vis-network": "^9.1.9"
+    "vscode:prepublish": "npm run typecheck && node esbuild.js --production"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
     "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
     "esbuild": "^0.20.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "vis-network": "^9.1.13"
   },
   "contributes": {
     "commands": [
@@ -192,13 +204,61 @@
         },
         "callatlas.maxHops": {
           "type": "number",
-          "default": 4,
-          "description": "Maximum number of BFS hops for Function Graph. / Function Graph の BFS 最大ホップ数。"
+          "default": 0,
+          "minimum": 0,
+          "description": "Maximum number of BFS hops for Function Graph and Path-Through Graph. Set to 0 for unlimited (default). / Function Graph・Path-Through Graph の BFS 最大ホップ数。0 を指定すると無制限（デフォルト）。"
         },
         "callatlas.warnThreshold": {
           "type": "number",
           "default": 30,
           "description": "Warn when the number of files to analyze exceeds this threshold. / 解析対象ファイル数がこの閾値を超えたときに警告を表示する。"
+        },
+        "callatlas.regenerateMode": {
+          "type": "string",
+          "enum": [
+            "repeat",
+            "reselect"
+          ],
+          "default": "repeat",
+          "enumDescriptions": [
+            "Re-run with the exact same backend/output mode as last time / 直前と全く同じ設定(バックエンド・出力モード・拡張子)で再実行する",
+            "Keep the same target (file/function/folder) but ask again for backend/output mode (and extensions for workspace/folder) / 対象(ファイル・関数位置・フォルダ)は直前と同じまま、バックエンド・出力モード(・拡張子)を選び直す"
+          ],
+          "description": "What happens when you click \"Regenerate\" from the status bar. / ステータスバーの「Regenerate」をクリックしたときの挙動。"
+        },
+        "callatlas.gtagsUpdateInterval": {
+          "type": "string",
+          "enum": [
+            "always",
+            "5",
+            "30",
+            "60",
+            "off"
+          ],
+          "default": "5",
+          "enumDescriptions": [
+            "Always run 'global -u' before every gtags analysis / 解析の度に必ず global -u を実行する（常に最新だがその分遅い）",
+            "Skip if updated within the last 5 minutes (default) / 直近5分以内に更新済みならスキップ（デフォルト）",
+            "Skip if updated within the last 30 minutes / 直近30分以内に更新済みならスキップ",
+            "Skip if updated within the last 60 minutes / 直近60分以内に更新済みならスキップ",
+            "Never auto-update; run 'gtags' manually yourself / 自動更新しない。gtagsは手動実行する前提（大規模プロジェクト向け）"
+          ],
+          "description": "How often to run 'global -u' to refresh the gtags database. / gtags DB（global -u）の自動更新間隔。"
+        },
+        "callatlas.colorTheme": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "light",
+            "dark"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Follow VS Code's current color theme / VS Codeの現在のカラーテーマに追従する",
+            "Always use light colors / 常にライトカラーを使用する",
+            "Always use dark colors / 常にダークカラーを使用する"
+          ],
+          "description": "Color theme for the call graph view (panel, background and node/edge colors). / コールグラフ表示のカラーテーマ(パネル・背景・ノード/エッジ配色)。"
         },
         "callatlas.initialControlPanel": {
           "type": "string",
@@ -215,5 +275,10 @@
         }
       }
     }
-  }
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/uta1214/call-atlas/issues"
+  },
+  "homepage": "https://github.com/uta1214/call-atlas#readme"
 }

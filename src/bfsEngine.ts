@@ -17,6 +17,21 @@ import {
   Pct,
 } from './utils';
 
+function updateNodeFromItem(node: GraphNode, item: vscode.CallHierarchyItem): void {
+  // B10修正: item がノードの実ファイルと異なる場合は更新しない。
+  // findExistingCalleeId のヘッダ用フォールバックで別ファイルのノードIDが
+  // 誤って返された場合に、既存ノードの line/scopeEnd がヘッダ側の行番号で
+  // 上書きされてしまうのを防ぐ(通常の同一ファイル内更新には影響しない)。
+  if (item.uri.fsPath !== node.file) return;
+  const definitionLine = item.range.end.line > item.selectionRange.start.line;
+  const currentDefinition = (node.scopeEnd ?? node.line) > node.line;
+  if (definitionLine && !currentDefinition) {
+    node.line = item.selectionRange.start.line + 1;
+    node.scopeEnd = item.range.end.line + 1;
+    node.labelFull = item.name;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BFS 共通インターフェース
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +138,8 @@ export async function lspBfs(opts: LspBfsOptions): Promise<BfsResult> {
         };
         nodes.set(nodeId, newNode);
         addToNodeIndex(nodeIndex, nodeId, newNode);
+      } else {
+        updateNodeFromItem(nodes.get(nodeId)!, item);
       }
 
       // maxHops 到達済みのノードは展開しない（登録だけ行う）
@@ -166,7 +183,7 @@ export async function lspBfs(opts: LspBfsOptions): Promise<BfsResult> {
         if (!calleeId) {
           // wsRoots ガード: shouldIncludeCallee は wsRoots=[] で常に false (安全側)
           if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
-          calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+          calleeId = makeNodeId(to.uri, to.name);
           if (!nodes.has(calleeId)) {
             const calleeNode: GraphNode = {
               id:            calleeId,
@@ -194,7 +211,7 @@ export async function lspBfs(opts: LspBfsOptions): Promise<BfsResult> {
         if (!callerId) {
           // outgoing と同じく shouldIncludeCallee でガード（isInWorkspace + 拡張子チェック）
           if (!shouldIncludeCallee(call.from.uri, wsRoots)) continue;
-          callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
+          callerId = makeNodeId(call.from.uri, call.from.name);
         }
         if (!nodes.has(callerId)) {
           const callerNode: GraphNode = {

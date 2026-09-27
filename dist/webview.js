@@ -22,9 +22,156 @@
   //   内部で行うため、この閾値を超えると計算が破綻して全ノードが (0,0) に集まり
   //   白紙グラフになる。閾値を超えた場合は physics ベースのレイアウトにフォールバック。
   var HIERARCHICAL_THRESHOLD = 150;
+  // ここから HIERARCHICAL_LIGHT_THRESHOLD までは hierarchical を維持しつつ
+  // blockShifting / edgeMinimization / parentCentralization という重い最適化だけを
+  // 切った「軽量 hierarchical」を使う。sortMethod は 'hubsize' のまま変えない
+  // (上の 'directed' 崩壊のコメント通り、sortMethod を変えると閾値内でも
+  //  壊れるリスクがあるため)。
+  // この値は未検証の目安。実際の環境で 150〜1500 あたりの規模をいくつか試して、
+  // 崩れる/重すぎるようなら調整すること。
+  var HIERARCHICAL_LIGHT_THRESHOLD = 800;
   var network  = null;
   var nodes    = null;
   var edges    = null;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // レイアウト tier 判定と vis-network オプション組み立て (共通化)
+  // ─────────────────────────────────────────────────────────────────────────
+  function getLayoutTier(n) {
+    if (n <= HIERARCHICAL_THRESHOLD) return 'full';
+    if (n <= HIERARCHICAL_LIGHT_THRESHOLD) return 'light';
+    return 'physics';
+  }
+
+  function buildLayoutOptions(tier) {
+    if (tier === 'full') {
+      return {
+        layout: { hierarchical: {
+          enabled: true, direction: 'LR', sortMethod: 'hubsize',
+          levelSeparation: 220, nodeSpacing: 70, treeSpacing: 130,
+          blockShifting: true, edgeMinimization: true, parentCentralization: true
+        }},
+        physics: { enabled: false }
+      };
+    }
+    if (tier === 'light') {
+      return {
+        layout: { hierarchical: {
+          enabled: true, direction: 'LR', sortMethod: 'hubsize',
+          levelSeparation: 220, nodeSpacing: 60, treeSpacing: 100,
+          blockShifting: false, edgeMinimization: false, parentCentralization: false
+        }},
+        physics: { enabled: false }
+      };
+    }
+    // 'physics': x は bfsLevel から renderGraph 側で固定済み (fixed.x = true)。
+    // physics は同じ x 列内での y 方向の重なり解消だけを担当する。
+    return {
+      layout: { hierarchical: { enabled: false } },
+      physics: {
+        enabled: true,
+        solver: 'forceAtlas2Based',
+        forceAtlas2Based: {
+          gravitationalConstant: -50, springLength: 80,
+          springConstant: 0.05, avoidOverlap: 0.3
+        },
+        stabilization: { iterations: 200, fit: true },
+      }
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // カラーテーマ (callatlas.colorTheme: auto/light/dark)
+  // ─────────────────────────────────────────────────────────────────────────
+  // ノードは shape:'dot' のため、ラベル文字はノードの塗り色の中ではなく
+  // キャンバス背景の上に描画される。そのため「キャンバスの明暗」に応じて
+  // ラベル文字色・非強調(dimmed)ノードの色・エッジのハイライト/薄色を
+  // 切り替える必要がある。選択/callee/callerの塗り色(アクセントカラー)自体は
+  // どちらの背景でも視認性を保てるため、ライト/ダークで変更しない。
+  var THEMES = {
+    light: {
+      bg:             '#f8f9fa',
+      nodeFontDefault:'#2d3436',
+      selectedFont:   '#1a3d5c',
+      calleeFont:     '#6d2b1a',
+      callerFont:     '#003d33',
+      unrelatedBg:    '#ececec', unrelatedBorder: '#cccccc', unrelatedFont: '#bbbbbb',
+      hopHiddenBg:    '#f0f0f0', hopHiddenBorder: '#e0e0e0', hopHiddenFont: '#e0e0e0',
+      searchDimFont:  '#dddddd',
+      edgeNormal:      '#aaaaaa',
+      edgeHighlighted: '#636e72',
+      edgeDimmed:      '#e8e8e8',
+      edgeHopDimmed:   '#eeeeee',
+    },
+    dark: {
+      bg:             '#1e1e1e',
+      nodeFontDefault:'#e6e6e6',
+      selectedFont:   '#cfe6ff',
+      calleeFont:     '#ffd9cc',
+      callerFont:     '#bdf5e0',
+      unrelatedBg:    '#3a3a3a', unrelatedBorder: '#4d4d4d', unrelatedFont: '#5a5a5a',
+      hopHiddenBg:    '#2a2a2a', hopHiddenBorder: '#383838', hopHiddenFont: '#333333',
+      searchDimFont:  '#3a3a3a',
+      edgeNormal:      '#aaaaaa',
+      edgeHighlighted: '#b0b6bc',
+      edgeDimmed:      '#333333',
+      edgeHopDimmed:   '#2e2e2e',
+    }
+  };
+  var currentThemeMode = 'light'; // 'light' | 'dark' (解決済みの実効テーマ)
+  function T() { return THEMES[currentThemeMode]; }
+
+  function detectPrefersDarkOS() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  // VS Code Webview には <body> に vscode-light / vscode-dark / vscode-high-contrast
+  // のいずれかのクラスが付与され、テーマ切り替え時にも自動で更新される。
+  // スタンドアロンHTML書き出し版にはこのクラスが無いため OS の prefers-color-scheme を見る。
+  function detectAutoIsDark() {
+    var cls = document.body ? document.body.className : '';
+    if (isVscode) {
+      if (/vscode-dark|vscode-high-contrast(?!-light)/.test(cls)) return true;
+      if (/vscode-light|vscode-high-contrast-light/.test(cls)) return false;
+    }
+    return detectPrefersDarkOS();
+  }
+
+  var colorThemeSetting  = 'auto';
+  var themeObserverStarted = false;
+  function applyColorTheme(setting, opts) {
+    colorThemeSetting = setting || 'auto';
+    var isDark = colorThemeSetting === 'dark' ? true
+               : colorThemeSetting === 'light' ? false
+               : detectAutoIsDark();
+    var changed = (isDark ? 'dark' : 'light') !== currentThemeMode;
+    currentThemeMode = isDark ? 'dark' : 'light';
+    document.documentElement.classList.toggle('atlas-dark', isDark);
+    // auto設定時のみ、VS Code側のテーマ切り替えをライブ監視する(1回だけ登録)。
+    if (isVscode && document.body && colorThemeSetting === 'auto' && !themeObserverStarted) {
+      themeObserverStarted = true;
+      new MutationObserver(function () {
+        if (colorThemeSetting !== 'auto') return;
+        applyColorTheme('auto');
+      }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    }
+    // 再描画: 既にグラフが読み込まれた後のライブなテーマ切り替えでは、
+    // ノード/エッジの色を新テーマで塗り直す。
+    // Bug A修正: resetAll() は検索/選択/Hop filterの状態まで無条件にクリアしてしまうため、
+    // 「今の状態を保ったまま色だけ塗り直す」repaintTheme() に差し替える。
+    if (changed && !(opts && opts.skipRepaint) && nodes) {
+      repaintTheme();
+    }
+  }
+
+  // グラフデータ('graphData'/INITIAL_GRAPH_DATA)到着前の一瞬(ローディング画面)にも
+  // 正しいテーマで表示するため、webviewPanel.ts が早期に埋め込む
+  // window.__CALLATLAS_COLOR_THEME__ を使って先にテーマだけ適用しておく。
+  // (スタンドアロン版ではこのグローバル変数は無いので 'auto' 扱いになり、
+  //  直後の renderGraph(INITIAL_GRAPH_DATA) で確定値に上書きされる)
+  applyColorTheme(
+    typeof window.__CALLATLAS_COLOR_THEME__ !== 'undefined' ? window.__CALLATLAS_COLOR_THEME__ : 'auto',
+    { skipRepaint: true }
+  );
 
   var nodeInfoMap          = {};   // id → { file, line, scopeEnd, label, labelFull, source? }
   var showFullSig          = false; // 引数表示トグル (sig-toggle)。デフォルトはオフ。
@@ -46,12 +193,17 @@
       case 'loading':    showLoading(msg.fileName);          break;
       case 'graphData':  renderGraph(msg);                   break;
       case 'error':      hideLoading(); showErrorInView(msg.message); break;
+      case 'cancelled':  hideLoading(); showCancelledInView();        break;
       case 'sourceData':
         // requestSource の応答: source を nodeInfoMap にキャッシュして表示
         if (nodeInfoMap[msg.nodeId]) {
           nodeInfoMap[msg.nodeId].source = msg.source;
         }
-        pendingSourceNodeId = null;
+        // 現在 pending 中のリクエストと一致する場合のみクリアする。
+        // 無条件でクリアすると、A→B と連続クリックした際に遅れて届いた
+        // A の応答が B の pending 状態を誤って解除してしまい、
+        // B の応答が届く前に A への再クリックで重複リクエストが飛びうる。
+        if (msg.nodeId === pendingSourceNodeId) pendingSourceNodeId = null;
         // 現在表示中のノードと一致する場合のみ再描画
         if (msg.nodeId === currentSourceNodeId) _renderSourceContent(msg.nodeId);
         break;
@@ -86,7 +238,19 @@
   // HTML 属性値（title 等）のエスケープ（escapeHtml と同一）
   var escapeAttr = escapeHtml;
 
+  // A1修正: #network の innerHTML を書き換える前に、既存の vis.Network インスタンスを
+  // 破棄して network/nodes/edges を null に戻す。これをしないと、次回 renderGraph() が
+  // 「network は non-null だから既存インスタンスを再利用する」分岐に入ってしまい、
+  // 既に innerHTML 書き換えで DOM から切り離された canvas へ描画し続けて何も見えなくなる。
+  function destroyNetworkState() {
+    if (network) { try { network.destroy(); } catch (e) { /* 既に破棄済み等は無視 */ } }
+    network = null;
+    nodes   = null;
+    edges   = null;
+  }
+
   function showErrorInView(msg) {
+    destroyNetworkState();
     document.getElementById('network').innerHTML =
       '<div style="display:flex;align-items:center;justify-content:center;' +
       'height:100%;flex-direction:column;gap:12px;padding:40px;">' +
@@ -100,11 +264,49 @@
       '</div>';
   }
 
+  // ユーザーによるキャンセル専用。showErrorInView と違い、警告アイコンや
+  // 「clangd/gtagsを確認して」といった文言を出さない(失敗ではないため)。
+  function showCancelledInView() {
+    destroyNetworkState();
+    document.getElementById('network').innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:center;' +
+      'height:100%;flex-direction:column;gap:10px;padding:40px;color:#b2bec3;' +
+      'font-family:monospace;">' +
+      '<span style="font-size:28px;">⏹</span>' +
+      '<p style="font-size:13px;">Analysis cancelled.</p>' +
+      '</div>';
+  }
+
+  // A1修正(防御策): network が non-null でも、その canvas が既に DOM から
+  // 切り離されている(#network の innerHTML が別経路で書き換わった等)場合は
+  // 再利用せず作り直す。vis-network 内部の network.body.container を参照するため
+  // try/catch で保護し、参照できない場合は安全側(再利用しない=false)に倒す。
+  function isNetworkAttached() {
+    // R2修正: network.body.container は vis.Network のコンストラクタに渡した
+    // #network 要素そのもの(参照)であり、innerHTML を書き換えても要素自体は
+    // DOMに残り続けるため isConnected は常に true になり判定になっていなかった。
+    // 実際に切り離されるのは vis-network が内部で作る描画用フレーム
+    // (class="vis-network" のdiv、vis-network 9.1.13 のソースで確認済み)なので、
+    // それが #network の子として存在するかで判定する。
+    try {
+      var container = document.getElementById('network');
+      return !!(network && container && container.querySelector('.vis-network'));
+    } catch (e) { return false; }
+  }
+
+
+
   // ─────────────────────────────────────────────────────────────────────────
   // グラフ描画
   // ─────────────────────────────────────────────────────────────────────────
 
   function renderGraph(msg) {
+    // colorTheme(auto/light/dark)を確定させる。ここは WebView 版('graphData'メッセージ)・
+    // スタンドアロン版(INITIAL_GRAPH_DATA)どちらの経路でも通る唯一の入口なので、
+    // ここで一度だけ解決すれば以降の全ノード/エッジ描画に反映される。
+    // まだ nodes が無い(初回)ので resetAll() による再描画は不要 → skipRepaint。
+    applyColorTheme(msg.colorTheme, { skipRepaint: true });
+
     nodeInfoMap = {};
     msg.nodes.forEach(function (n) {
       nodeInfoMap[n.id] = {
@@ -117,8 +319,14 @@
       };
     });
 
+    // A5修正: 自己ループ(e.from === e.to)は「外部からの入力」ではないので入次数から除外する。
+    // 除外しないと純粋な自己再帰関数(f→f)の入次数が1になってしまい root として検出されず、
+    // 相互再帰グループ全体が「root 0件」と判定されて、後段の孤立ノード救済で
+    // 全ノードが level=0 に潰れる原因になっていた。
     var inDeg = {};
-    msg.edges.forEach(function (e) { inDeg[e.to] = (inDeg[e.to] || 0) + 1; });
+    msg.edges.forEach(function (e) {
+      if (e.from !== e.to) inDeg[e.to] = (inDeg[e.to] || 0) + 1;
+    });
 
     // ─── BFS 最短パスレベル計算 ───────────────────────────────────────────────
     // vis-network のデフォルト動作 (longest-path) だと、同じ caller から呼ばれた
@@ -131,9 +339,11 @@
     //           → C ──────↗   (C の level は A と同じ 1 に固定)
     //
     // 手順:
-    //   1. 入次数 0 のノードを root として level = 0 に設定
-    //   2. BFS で隣接ノードに level = min(現在値, 親level + 1) を伝播
-    //      (複数の親を持つノードは最も浅い親 +1 を採用)
+    //   1. 入次数 0 のノードを root として level = 0 に設定し BFS で伝播
+    //   2. まだ level が付いていないノードが残る場合(root を持たない循環グループ)、
+    //      その中で msg.nodes の並び順で先頭の未訪問ノードを新たな種(level = 0)にして
+    //      再度 BFS で伝播する。これを全ノードに level が付くまで繰り返す。
+    //      (既に level が確定したノードは上書きしない)
     var bfsLevel = {};
     var adjOut = {};   // nodeId → [隣接 to の nodeId]
     msg.nodes.forEach(function (n) { adjOut[n.id] = []; });
@@ -141,41 +351,66 @@
       if (adjOut[e.from]) adjOut[e.from].push(e.to);
     });
 
-    // root = 入次数 0 のノード
-    var bfsQueue = [];
-    msg.nodes.forEach(function (n) {
-      if (!inDeg[n.id]) {           // 入次数 0
-        bfsLevel[n.id] = 0;
-        bfsQueue.push(n.id);
+    // サイクルグラフで bfsLevel の更新が収束するまで同じノードが再度キューに積まれ
+    // O(N²) になる問題を防ぐため、inQueue セットで重複追加を抑制する。
+    // サイクルが多数ある場合のキュー膨張を防ぐため上限も設ける(種ごとにリセット)。
+    var BFS_QUEUE_LIMIT = msg.nodes.length * 10;
+
+    function propagateLevels(seedIds, locked) {
+      var queue   = seedIds.slice();
+      var inQueue = new Set(queue);
+      var qi = 0;
+      while (qi < queue.length) {
+        var cur = queue[qi++];
+        inQueue.delete(cur);
+        var nextLevel = bfsLevel[cur] + 1;
+        (adjOut[cur] || []).forEach(function (to) {
+          // R3修正: 呼び出し元(孤立ノード救済フェーズ)から渡された「確定済み」
+          // ノード集合に含まれる場合は動かさない。これが無いと、root を持たない
+          // 循環グループ(救済フェーズで後から seed される)が、既に正しく配置済みの
+          // ノードへ辺を持つ場合に、その確定済みノードの level を引き下げてしまい、
+          // 辺の向きが直感に反する見た目になっていた。
+          if (locked && locked[to]) return;
+          // 未訪問 OR より浅いパスが見つかった場合にのみ更新
+          if (bfsLevel[to] === undefined || bfsLevel[to] > nextLevel) {
+            bfsLevel[to] = nextLevel;
+            if (!inQueue.has(to) && queue.length < BFS_QUEUE_LIMIT) {
+              inQueue.add(to);
+              queue.push(to); // 更新があったので再伝播
+            }
+          }
+        });
       }
-    });
-    // 孤立ノード保険: root が 0 件なら全ノードを level=0 で初期化して BFS
-    if (bfsQueue.length === 0) {
-      msg.nodes.forEach(function (n) { bfsLevel[n.id] = 0; bfsQueue.push(n.id); });
     }
 
-    var qi = 0;
-    // サイクルグラフで bfsLevel の更新が収束するまで同じノードが bfsQueue に大量追加され
-    // O(N²) になる問題を防ぐため、inQueue セットで重複追加を抑制する。
-    // サイクルが多数ある場合の bfsQueue 膨張を防ぐためキューの上限も設ける。
-    var BFS_QUEUE_LIMIT = msg.nodes.length * 10;
-    var inQueue = new Set(bfsQueue);
-    while (qi < bfsQueue.length) {
-      var cur = bfsQueue[qi++];
-      inQueue.delete(cur);
-      var nextLevel = bfsLevel[cur] + 1;
-      (adjOut[cur] || []).forEach(function (to) {
-        // 未訪問 OR より浅いパスが見つかった場合にのみ更新
-        if (bfsLevel[to] === undefined || bfsLevel[to] > nextLevel) {
-          bfsLevel[to] = nextLevel;
-          if (!inQueue.has(to) && bfsQueue.length < BFS_QUEUE_LIMIT) {
-            inQueue.add(to);
-            bfsQueue.push(to); // 更新があったので再伝播
-          }
-        }
-      });
-    }
-    // ─────────────────────────────────────────────────────────────────────────
+    // root = 入次数 0 のノード
+    var roots = [];
+    msg.nodes.forEach(function (n) {
+      if (!inDeg[n.id]) {           // 入次数 0 (自己ループ除外後)
+        bfsLevel[n.id] = 0;
+        roots.push(n.id);
+      }
+    });
+    propagateLevels(roots);
+
+    // 孤立ノード救済: root(入次数0のノード)が無い循環グループが残っている場合、
+    // その中で先頭の未訪問ノードだけを level=0 の種にして BFS をやり直す。
+    // 全ノードを一括で level=0 にリセットすると「全員が既に0」で
+    // 更新条件(bfsLevel[to] > nextLevel = 0 > 1 = false)を満たせず一切伝播が起きず、
+    // グラフ全体が1列に潰れてしまっていた。
+    // R3修正: この時点で既に level が付いているノードは「確定済み」として
+    // locked に入れ、propagateLevels に渡す。渡さないと、後から seed される
+    // 循環グループが確定済みノードへ辺を持つ場合に、そのノードの level を
+    // 引き下げてしまうことがあった(コメント「既に確定したノードは上書きしない」
+    // という意図と実際の挙動が一致していなかった)。
+    msg.nodes.forEach(function (n) {
+      if (bfsLevel[n.id] === undefined) {
+        var locked = {};
+        Object.keys(bfsLevel).forEach(function (id) { locked[id] = true; });
+        bfsLevel[n.id] = 0;
+        propagateLevels([n.id], locked);
+      }
+    });
 
     // ─── level 内の縦順を固定 (order) ───────────────────────────────────────
     // Same level nodes are sorted by file name then line number so the layout
@@ -202,8 +437,16 @@
     });
     // ─────────────────────────────────────────────────────────────────────────
 
+    var layoutTier = getLayoutTier(msg.nodes.length);
+    // physics tier: x は bfsLevel(=root からのホップ数)で固定し、
+    // 「左→右」の流れだけは物理演算下でも必ず保つ。
+    // y は level 内の並び順 (nodeOrder) を初期値にして physics に重なり解消させる。
+    // 1 レベルに大量のノードが集中すると縦に無限に伸びてしまうため、
+    // WRAP_SIZE 件を超えたら同じレベル内で横に折り返して複数列に分ける。
+    var X_SPACING = 220, Y_SPACING = 40, WRAP_SIZE = 50, SUBCOL_OFFSET = 40;
+
     var visNodes = msg.nodes.map(function (n) {
-      return {
+      var vn = {
         id:          n.id,
         label:       getLabel(nodeInfoMap[n.id] || n),
         title:       n.title,
@@ -211,17 +454,24 @@
         size:        Math.min(12 + ((inDeg[n.id] || 0) * 3), 40),
         shape:       'dot',
         borderWidth: n.isCurrentFile ? 2 : 1,
-        font:        { size: DEFAULT_FONT_SIZE, face: 'monospace', color: '#2d3436' },
+        font:        { size: DEFAULT_FONT_SIZE, face: 'monospace', color: T().nodeFontDefault },
         shadow:      { enabled: true, size: 4, x: 2, y: 2, color: 'rgba(0,0,0,0.08)' },
         level:       bfsLevel[n.id]  !== undefined ? bfsLevel[n.id]  : 0,
         order:       nodeOrder[n.id] !== undefined ? nodeOrder[n.id] : 0
       };
+      if (layoutTier === 'physics') {
+        var subCol = Math.floor(vn.order / WRAP_SIZE);
+        vn.x     = vn.level * X_SPACING + subCol * SUBCOL_OFFSET;
+        vn.y     = (vn.order % WRAP_SIZE) * Y_SPACING;
+        vn.fixed = { x: true, y: false };
+      }
+      return vn;
     });
 
     var visEdges = msg.edges.map(function (e, i) {
       return {
         id: i, from: e.from, to: e.to, arrows: 'to',
-        color:  { color: '#aaaaaa', hover: '#aaaaaa', highlight: '#aaaaaa' },
+        color:  { color: T().edgeNormal, hover: T().edgeNormal, highlight: T().edgeNormal },
         width:  1,
         smooth: { enabled: true, type: 'cubicBezier', forceDirection: 'horizontal', roundness: 0.5 }
       };
@@ -231,24 +481,20 @@
     // nodes を先に消すとエッジが存在しないノードを参照する状態になり
     // vis-network が内部エラーで描画を中断するため白紙になる。
     // ノード数に応じてレイアウトを切り替える:
-    // hierarchical は大量ノードで破綻するため閾値を超えたら無効化する。
-    if (network) {
+    // hierarchical は大量ノードで破綻するため tier(full/light/physics)で分岐する。
+    if (network && isNetworkAttached()) {
       // 前回の stabilize が完了していない状態で再レンダリングが呼ばれた場合、
       // 古いハンドラが先に発火して競合が発生するため stopSimulation() で先に停止させる。
       network.stopSimulation();
-      var useHierarchical = visNodes.length <= HIERARCHICAL_THRESHOLD;
-      network.setOptions({ layout: { hierarchical: { enabled: useHierarchical } } });
+      var reOpts = buildLayoutOptions(layoutTier);
+      network.setOptions({ layout: reOpts.layout, physics: reOpts.physics });
       edges.clear(); edges.add(visEdges);
       nodes.clear(); nodes.add(visNodes);
-      if (!useHierarchical) {
-        document.getElementById('loading-overlay').style.display = 'flex';
-        network.once('stabilizationIterationsDone', function () {
-          network.fit();
-          hideLoading();
-        });
+      if (layoutTier === 'physics') {
+        bindPhysicsProgressHandlers(network);
         network.stabilize(200);
       } else {
-        // hierarchical モードは physics と対称に fit() を呼んでズーム位置をリセットする
+        // hierarchical (full/light) モードは physics と対称に fit() を呼んでズーム位置をリセットする
         network.fit();
       }
     } else {
@@ -259,30 +505,41 @@
 
     defaultNodeColors = {};
     nodes.forEach(function (n) {
+      // fontColor は全ノード共通のテーマ依存値(per-fileの背景色 color とは違いノード固有
+      // ではない)なのでキャッシュしない。参照側は必ず T().nodeFontDefault を直接呼ぶ。
+      // (キャッシュすると、グラフ構築時点のテーマ色のまま固まり、ライブテーマ切替後に
+      //  古いテーマの文字色で塗り直されてしまうバグの原因になっていた)
       defaultNodeColors[n.id] = {
-        color:     JSON.parse(JSON.stringify(n.color || {})),
-        fontColor: (n.font && n.font.color) ? n.font.color : '#2d3436'
+        color: JSON.parse(JSON.stringify(n.color || {}))
       };
     });
 
     renderLegend(msg.fileLegend);
+    closeWarningModal(); // 再解析時に前回の警告モーダルが残らないようにする
 
     var errNote = (msg.errors && msg.errors.length > 0)
       ? ' ⚠️ warnings: ' + msg.errors.length : '';
-    var layoutNote = visNodes.length > HIERARCHICAL_THRESHOLD
-      ? ' [physics]' : ' [hierarchical]';
+    var layoutNote =
+      layoutTier === 'full'   ? ' [hierarchical]' :
+      layoutTier === 'light'  ? ' [hierarchical-light]' :
+                                 ' [physics]';
     var buildInfoEl = document.getElementById('build-info');
     buildInfoEl.textContent =
       'Nodes: ' + msg.nodes.length + ' / Edges: ' + msg.edges.length +
       ' / ' + msg.buildTimeMs + 'ms' + layoutNote + errNote;
 
-    // 警告がある場合: hover で詳細を表示、クリックでアラート
+    // 警告がある場合: hover で詳細を表示、クリックでモーダル表示
+    // alert() は VSCode webview の sandboxed iframe 内では動作しないため
+    // (allow-modals が付与されていない)、自前の DOM モーダルを使う。
     if (msg.errors && msg.errors.length > 0) {
       buildInfoEl.style.cursor  = 'pointer';
       buildInfoEl.style.color   = '#e17055';
-      buildInfoEl.title = msg.errors.map(escapeAttr).join('\n');
+      // C1修正: .title はDOMプロパティへの代入であり、innerHTMLのようにHTMLとして
+      // 解釈されるわけではない。escapeAttr(HTMLエンティティ変換)をかけると
+      // ブラウザはそのままの文字列("&amp;"等)を表示してしまう(二重エスケープ)。
+      buildInfoEl.title = msg.errors.join('\n');
       buildInfoEl.onclick = function () {
-        alert('Build warnings (' + msg.errors.length + '):\n\n' + msg.errors.map(escapeHtml).join('\n'));
+        openWarningModal(msg.errors);
       };
     } else {
       buildInfoEl.style.cursor  = '';
@@ -299,57 +556,72 @@
       setControlsCollapsed(msg.controlPanelCollapsed);
     }
 
-    // hierarchical モードは同期描画なのでここで即座にローディングを消す。
-    // physics モードは initNetwork 内の stabilizationIterationsDone で消す。
-    if (visNodes.length <= HIERARCHICAL_THRESHOLD) {
+    // hierarchical (full/light) は同期描画なのでここで即座にローディングを消す。
+    // physics モードは initNetwork 内 (または上の再描画パス) の
+    // stabilizationIterationsDone で消す。
+    if (layoutTier !== 'physics') {
       hideLoading();
     }
   }
 
+  /**
+   * physics tier (大規模グラフ) 用の共通ハンドラ登録。
+   * initNetwork() (network 新規作成時) と renderGraph() (既存 network を
+   * 再利用する再描画パス) の両方から呼ぶ。
+   * 以前は initNetwork() 側にしか stabilizationProgress の登録が無く、
+   * パネルを開いたまま2回目以降の解析で physics tier に切り替わった場合、
+   * "Computing layout... NN%" の進捗表示が一切更新されず、ローディング
+   * メッセージが(前回のものや"Analyzing..."のまま)固まって見えるバグがあった。
+   * off() してから on() することで、同じ network インスタンスに対して
+   * 複数回呼ばれても stabilizationProgress ハンドラが重複登録されない
+   * (呼ぶたびに増え続けることがない)ようにする。
+   */
+  function bindPhysicsProgressHandlers(net) {
+    document.getElementById('loading-overlay').style.display = 'flex';
+    net.off('stabilizationProgress');
+    net.on('stabilizationProgress', function (params) {
+      document.getElementById('loading-msg').textContent =
+        'Computing layout... ' + Math.round(params.iterations / params.total * 100) + '%';
+    });
+    net.once('stabilizationIterationsDone', function () {
+      net.setOptions({ physics: { enabled: false } });
+      net.fit();
+      hideLoading();
+    });
+  }
+
   function initNetwork(nodeCount) {
-    // ノード数が閾値以下なら hierarchical、超えたら physics フォールバック
-    var useHierarchical = nodeCount <= HIERARCHICAL_THRESHOLD;
-
-    var layoutOpt = useHierarchical
-      ? {
-          hierarchical: {
-            enabled: true, direction: 'LR', sortMethod: 'hubsize',
-            levelSeparation: 220, nodeSpacing: 70, treeSpacing: 130,
-            blockShifting: true, edgeMinimization: true, parentCentralization: true
-          }
-        }
-      : { hierarchical: { enabled: false } };
-
-    var physicsOpt = useHierarchical
-      ? { enabled: false }
-      : {
-          enabled: true,
-          solver: 'forceAtlas2Based',
-          forceAtlas2Based: { gravitationalConstant: -80, springLength: 120, springConstant: 0.08 },
-          stabilization: { iterations: 200, fit: true },
-        };
+    var tier = getLayoutTier(nodeCount);
+    var opts = buildLayoutOptions(tier);
 
     network = new vis.Network(
       document.getElementById('network'),
       { nodes: nodes, edges: edges },
       {
-        layout: layoutOpt,
+        layout: opts.layout,
         nodes: {
           shape: 'dot', borderWidth: 2,
           shadow: { enabled: true, size: 4, x: 2, y: 2, color: 'rgba(0,0,0,0.08)' },
-          font:   { size: 11, face: 'monospace' }
+          font:   { size: 11, face: 'monospace' },
+          // ノード・エッジの色/太さは nodes.update() / edges.update() で完全に手動管理しているため、
+          // vis-network 標準の chosen(選択・ホバー時の自動スタイル変更。デフォルトで有効)を無効化する。
+          // 有効なままだと、ノード/エッジをクリックして選択した際にネイティブの自動スタイル変更
+          // (borderWidth の倍加、矢印長に比例する width の加算等)が手動スタイルと二重に競合し、
+          // 選択解除後に矢印やノード枠がすごく太く表示されたまま残る不具合の原因になる。
+          chosen: false
         },
         edges: {
           smooth:         { enabled: true, type: 'cubicBezier', forceDirection: 'horizontal', roundness: 0.5 },
           arrows:         { to: { scaleFactor: 0.6 } },
-          color:          { color: '#aaaaaa', hover: '#aaaaaa', highlight: '#aaaaaa' },
-          hoverWidth:     0, selectionWidth: 0, width: 1
+          color:          { color: T().edgeNormal, hover: T().edgeNormal, highlight: T().edgeNormal },
+          hoverWidth:     0, selectionWidth: 0, width: 1,
+          chosen:         false
         },
         interaction: {
           hover: true, tooltipDelay: 80, navigationButtons: true,
           keyboard: false, zoomView: false
         },
-        physics: physicsOpt,
+        physics: opts.physics,
       }
     );
 
@@ -361,28 +633,27 @@
     });
     network.on('hoverNode', function (p) {
       if (currentNode !== null) return;
+      // エッジが選択中(ネイティブのクリックによる選択)の間にノードをホバーすると、
+      // このハンドラがそのエッジの色を書き換えてしまい、選択中の見た目とハイライト
+      // が競合してちらついて見えていた。この状態でのノードクリックは選択解除にしか
+      // ならず、ホバーしても実質意味が無いため、エッジ選択中はノードホバーの
+      // ハイライトを抑制する(エッジホバー時の強調は本ハンドラの対象外なので影響しない)。
+      if (network.getSelectedEdges().length > 0) return;
       edges.update(network.getConnectedEdges(p.node).map(function (id) {
-        return { id: id, color: { color: '#636e72', opacity: 1.0 }, width: 2.5 };
+        return { id: id, color: { color: T().edgeHighlighted, opacity: 1.0 }, width: 2.5 };
       }));
     });
     network.on('blurNode', function (p) {
       if (currentNode !== null) return;
+      if (network.getSelectedEdges().length > 0) return;
       edges.update(network.getConnectedEdges(p.node).map(function (id) {
-        return { id: id, color: { color: '#aaaaaa', opacity: 0.8 }, width: 1 };
+        return { id: id, color: { color: T().edgeNormal, opacity: 0.8 }, width: 1 };
       }));
     });
 
     // physics フォールバック時はスタビライズ中にローディングを表示する
-    if (!useHierarchical) {
-      document.getElementById('loading-overlay').style.display = 'flex';
-      network.on('stabilizationProgress', function (params) {
-        document.getElementById('loading-msg').textContent =
-          'Computing layout... ' + Math.round(params.iterations / params.total * 100) + '%';
-      });
-      network.once('stabilizationIterationsDone', function () {
-        network.fit();
-        hideLoading();
-      });
+    if (tier === 'physics') {
+      bindPhysicsProgressHandlers(network);
     }
 
     network.body.container.addEventListener('wheel', function (e) {
@@ -391,7 +662,17 @@
       var pos   = network.getViewPosition();
       var speed = 120 / scale;
       if (e.ctrlKey) {
-        network.moveTo({ scale: scale * (e.deltaY > 0 ? 0.85 : 1.15), animation: false });
+        var newScale = scale * (e.deltaY > 0 ? 0.85 : 1.15);
+        // ポインター直下のワールド座標を求め、ズーム後もその点がポインター位置に
+        // 留まるよう viewPosition を再計算する(中心固定ではなくポインター基準ズーム)。
+        var rect    = network.body.container.getBoundingClientRect();
+        var domPos  = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        var anchor  = network.DOMtoCanvas(domPos);
+        var newPos  = {
+          x: anchor.x - (anchor.x - pos.x) * (scale / newScale),
+          y: anchor.y - (anchor.y - pos.y) * (scale / newScale)
+        };
+        network.moveTo({ scale: newScale, position: newPos, animation: false });
       } else if (e.shiftKey) {
         network.moveTo({ position: { x: pos.x + e.deltaY * speed / 100, y: pos.y }, animation: false });
       } else {
@@ -418,12 +699,33 @@
   // ノードクリック
   // ─────────────────────────────────────────────────────────────────────────
 
+  // 選択中ノードのハイライト塗り直し。onNetworkClick と repaintTheme(テーマのライブ
+  // 切替時の再描画)で共有する。currentNode/connectedEdgesOfNode 等の状態は変更しない。
+  function applySelectionHighlight(id) {
+    var outgoing = new Set(network.getConnectedNodes(id, 'from')); // callees
+    var incoming = new Set(network.getConnectedNodes(id, 'to'));   // callers
+
+    // ノード自体の背景色は方向によって塗り分けたまま(選択中=青、呼び出し先=オレンジ、呼び出し元=緑)。
+    nodes.update(nodes.getIds().map(function (nid) {
+      if (nid === id)         return { id: nid, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont(T().selectedFont) };
+      if (outgoing.has(nid)) return { id: nid, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont(T().calleeFont) };
+      if (incoming.has(nid)) return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont(T().callerFont) };
+      return { id: nid, color: { background: T().unrelatedBg, border: T().unrelatedBorder }, font: makeFont(T().unrelatedFont) };
+    }));
+
+    // エッジ(矢印)の色は方向による塗り分けをやめ、ホバー時と同じ単色に統一する。
+    edges.update(edges.getIds().map(function (eid) {
+      if (!connectedEdgesOfNode.has(eid)) return { id: eid, color: { color: T().edgeDimmed, opacity: 0.3 }, width: 1 };
+      return { id: eid, color: { color: T().edgeHighlighted, opacity: 1.0 }, width: 2.5 };
+    }));
+  }
+
   function onNetworkClick(params) {
-    if (params.nodes.length > 0 &&
-        params.event && params.event.srcEvent && params.event.srcEvent.ctrlKey) {
-      openNodeSource(params.nodes[0]);
-      return;
-    }
+    // C5修正: macOSではCtrl+Clickがトラックパッド/OSレベルで右クリック扱いに
+    // なることがあり、ctrlKeyだけに頼るとクリックできないことがある。
+    // Cmd+Click(metaKey)も同じ「ソースを開く」操作として受け付ける。
+    var isModifierClick = params.nodes.length > 0 && params.event && params.event.srcEvent &&
+        (params.event.srcEvent.ctrlKey || params.event.srcEvent.metaKey);
 
     if (!params.nodes.length) {
       // 検索中はノード選択だけリセットして検索を維持する。
@@ -432,29 +734,22 @@
       return;
     }
     var id = params.nodes[0];
-    // 同じノードを再クリック: 選択解除（検索中は検索を維持）
-    if (id === currentNode) { resetAll(!!searchBox.value.trim()); return; }
+
+    if (isModifierClick) {
+      // Ctrl/Cmd+Click: エディタでソースを開く。ハイライトの見た目は通常クリックと同じにする
+      // (下の共通ハイライト処理に合流させる)。同じノードの再クリックでも選択解除(トグル)は
+      // せず、毎回ソースを開く。
+      openNodeSource(id);
+    } else {
+      // 同じノードを再クリック: 選択解除（検索中は検索を維持）
+      if (id === currentNode) { resetAll(!!searchBox.value.trim()); return; }
+    }
 
     currentNode          = id;
     connectedEdgesOfNode = new Set(network.getConnectedEdges(id));
     _hadSelection        = true;
 
-    var outgoing = new Set(network.getConnectedNodes(id, 'from')); // callees
-    var incoming = new Set(network.getConnectedNodes(id, 'to'));   // callers
-
-    nodes.update(nodes.getIds().map(function (nid) {
-      if (nid === id)         return { id: nid, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
-      if (outgoing.has(nid)) return { id: nid, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(nid)) return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
-      return { id: nid, color: { background: '#ececec', border: '#cccccc' }, font: makeFont('#bbbbbb') };
-    }));
-
-    edges.update(edges.getIds().map(function (eid) {
-      if (!connectedEdgesOfNode.has(eid)) return { id: eid, color: { color: '#e8e8e8', opacity: 0.3 }, width: 1 };
-      var e   = edges.get(eid);
-      var col = (e.from === id) ? '#e17055' : '#00b894';
-      return { id: eid, color: { color: col, opacity: 1.0 }, width: 2.5 };
-    }));
+    applySelectionHighlight(id);
 
     document.getElementById('hop-panel').style.display = 'block';
     document.querySelectorAll('.hop-btn').forEach(function (b) { b.classList.remove('active'); });
@@ -491,22 +786,21 @@
 
     nodes.update(nodes.getIds().map(function (id) {
       var d = defaultNodeColors[id] || {};
-      if (!visible.has(id))        return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#e0e0e0') };
-      if (id === currentNode)       return { id: id, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
-      if (outgoing.has(id))         return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(id))         return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
-      return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
+      if (!visible.has(id))        return { id: id, color: { background: T().hopHiddenBg, border: T().hopHiddenBorder }, font: makeFont(T().hopHiddenFont) };
+      if (id === currentNode)       return { id: id, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont(T().selectedFont) };
+      if (outgoing.has(id))         return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont(T().calleeFont) };
+      if (incoming.has(id))         return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont(T().callerFont) };
+      return { id: id, color: d.color, font: makeFont(T().nodeFontDefault) };
     }));
 
     edges.update(edges.getIds().map(function (id) {
       var e = edges.get(id);
       if (!visible.has(e.from) || !visible.has(e.to))
-        return { id: id, color: { color: '#eeeeee', opacity: 0.2 }, width: 1 };
+        return { id: id, color: { color: T().edgeHopDimmed, opacity: 0.2 }, width: 1 };
       if (connectedEdgesOfNode.has(id)) {
-        var col = (e.from === currentNode) ? '#e17055' : '#00b894';
-        return { id: id, color: { color: col, opacity: 1.0 }, width: 2.5 };
+        return { id: id, color: { color: T().edgeHighlighted, opacity: 1.0 }, width: 2.5 };
       }
-      return { id: id, color: { color: '#aaaaaa', opacity: 0.6 }, width: 1 };
+      return { id: id, color: { color: T().edgeNormal, opacity: 0.6 }, width: 1 };
     }));
 
     document.querySelectorAll('.hop-btn').forEach(function (btn) {
@@ -575,7 +869,12 @@
     }
 
     // VSCode WebView 環境: requestSource を送って非同期取得
-    if (isVscode && info.file && pendingSourceNodeId !== nodeId) {
+    if (isVscode && info.file) {
+      // 同じノードに対して既に requestSource を送信済みで応答待ちの場合は、
+      // 何もせず現在の "// Loading..." 表示を維持する。
+      // (修正前は pendingSourceNodeId !== nodeId が false になりこの if を素通りして
+      //  下の "(Source not found)" が一瞬誤表示されていた)
+      if (pendingSourceNodeId === nodeId) return;
       pendingSourceNodeId = nodeId;
       // ヘッダ表示だけ先行描画し、ソース部分は "読み込み中..." を表示
       var baseName = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
@@ -622,14 +921,145 @@
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // HTML エクスポート
+  // 警告詳細モーダル
   // ─────────────────────────────────────────────────────────────────────────
 
-  document.getElementById('export-btn').addEventListener('click', function () {
-    if (isVscode) {
-      vscode.postMessage({ type: 'exportHtml' });
-    } else {
-      alert('This file is already a standalone HTML.');
+  function openWarningModal(errors) {
+    document.getElementById('warning-count').textContent = String(errors.length);
+    // textContent なのでエスケープ不要 (HTML として解釈されない)
+    document.getElementById('warning-modal-body').textContent = errors.join('\n');
+    document.getElementById('warning-modal').style.display = 'flex';
+  }
+  function closeWarningModal() {
+    document.getElementById('warning-modal').style.display = 'none';
+  }
+  document.getElementById('warning-modal-close').addEventListener('click', closeWarningModal);
+  document.getElementById('warning-modal').addEventListener('click', function (e) {
+    if (e.target === this) closeWarningModal(); // オーバーレイ背景クリックで閉じる
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // HTML / PNG エクスポート
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // B1修正: export-*-btn はライブwebview版のみに存在し(webviewPanel.ts で
+  // mode.kind === 'webview' の場合のみ描画)、スタンドアロンHTML書き出し版には存在しない。
+  // 無条件で getElementById(...).addEventListener(...) すると、
+  // スタンドアロン版では null に対して addEventListener を呼ぶことになり TypeError が発生、
+  // このファイル全体を包む IIFE がそこで停止して末尾の renderGraph(INITIAL_GRAPH_DATA) に
+  // 到達しなくなる(=スタンドアロンHTML書き出しが常にローディング画面のまま固まる)。
+  function bindExportBtn(id, handler) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('click', handler);
+  }
+
+  bindExportBtn('export-html-btn', function () {
+    if (isVscode) vscode.postMessage({ type: 'exportHtml' });
+    else alert('This file is already a standalone HTML.');
+  });
+
+  // PNG: 横幅3000px固定・グラフ全体・背景は現在のテーマ色で塗りつぶして書き出す。
+  //
+  // 旧実装は「画面に実際に表示されているnetwork/canvas自体」を一時的にリサイズ→
+  // キャプチャ→元に戻す、という方式だった。しかしこれには副作用があった:
+  //   ・画面外に退避させている間、表示中のグラフが本当に一瞬消える(ちらつく)
+  //     (退避先が画面外なだけで、表示していたcanvas自体を動かしているので当然消える)
+  //   ・network.setSize()を明示的に呼ぶと、それ以降vis-network内蔵の自動リサイズ
+  //     追従が効かなくなることがあり、エクスポート後にVS Codeウィンドウを最大化しても
+  //     グラフのキャンバスが拡大前のサイズのまま固定されてしまう
+  //   ・上記の影響で、位置の保存/復元(moveTo)のタイミング次第でグラフの表示位置が
+  //     まれにズレる
+  //
+  // そこで、表示中のnetwork/nodes/edgesには一切触れず、同じデータの複製(独立した
+  // DataSet)を使って画面外に「影武者」のvis.Networkを都度新しく作り、そこから
+  // キャプチャした後は丸ごと破棄する方式に変更した。表示中のグラフは触れられて
+  // すらいないので、ちらつき・自動リサイズ破損・位置ズレのいずれも起こり得ない。
+  var EXPORT_PNG_WIDTH = 3000;
+  var EXPORT_PADDING   = 0.03; // 余白の割合(以前はfit()任せで余白が大きすぎた)
+  bindExportBtn('export-png-btn', function () {
+    if (!isVscode) { alert('This export is only available from the VS Code webview.'); return; }
+    if (!network || !nodes || !edges) return;
+
+    var positions = network.getPositions();
+    var nodeList  = nodes.get();
+    var edgeList  = edges.get();
+
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodeList.forEach(function (n) {
+      var p = positions[n.id]; if (!p) return;
+      var r = n.size || 12;
+      minX = Math.min(minX, p.x - r); maxX = Math.max(maxX, p.x + r);
+      minY = Math.min(minY, p.y - r); maxY = Math.max(maxY, p.y + r);
+    });
+    if (!isFinite(minX)) { minX = -100; maxX = 100; minY = -100; maxY = 100; }
+    var contentW = Math.max(1, maxX - minX);
+    var contentH = Math.max(1, maxY - minY);
+    var exportHeight = Math.min(Math.max(Math.round(EXPORT_PNG_WIDTH * (contentH / contentW)), 400), 20000);
+
+    // 影武者用の独立したDataSet。現在の座標(positions)を fixed:{x:true,y:true} で
+    // そのまま固定するので、レイアウト計算(hierarchical/physics)は一切走らず、
+    // 今画面に見えている配置と完全に一致する。表示中のDataSetは共有しない
+    // (spread + 上書きで新規オブジェクトを作るだけなので、表示中のグラフを書き換える心配はない)。
+    var shadowNodes = new vis.DataSet(nodeList.map(function (n) {
+      var p = positions[n.id] || { x: 0, y: 0 };
+      return Object.assign({}, n, { x: p.x, y: p.y, fixed: { x: true, y: true } });
+    }));
+    var shadowEdges = new vis.DataSet(edgeList);
+
+    var hiddenContainer = document.createElement('div');
+    hiddenContainer.style.position = 'fixed';
+    hiddenContainer.style.left     = '-99999px';
+    hiddenContainer.style.top      = '0';
+    hiddenContainer.style.width    = EXPORT_PNG_WIDTH + 'px';
+    hiddenContainer.style.height   = exportHeight + 'px';
+    document.body.appendChild(hiddenContainer);
+
+    var shadowNetwork;
+    function cleanup() {
+      if (shadowNetwork) shadowNetwork.destroy();
+      hiddenContainer.remove();
+    }
+
+    try {
+      shadowNetwork = new vis.Network(
+        hiddenContainer,
+        { nodes: shadowNodes, edges: shadowEdges },
+        { autoResize: false, physics: { enabled: false } }
+      );
+      shadowNetwork.moveTo({
+        position: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 },
+        scale: Math.min(
+          (EXPORT_PNG_WIDTH * (1 - EXPORT_PADDING * 2)) / contentW,
+          (exportHeight     * (1 - EXPORT_PADDING * 2)) / contentH
+        ),
+        animation: false,
+      });
+
+      // moveTo()後の再描画が反映されるのを2フレーム分待ってからキャプチャする。
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          try {
+            var srcCanvas = hiddenContainer.querySelector('canvas');
+            var out = document.createElement('canvas');
+            out.width  = srcCanvas.width;
+            out.height = srcCanvas.height;
+            var ctx = out.getContext('2d');
+            // vis-networkのcanvas自体は背景を描画しない(透過)ため、
+            // 先に現在のテーマ背景色を塗ってから重ねて不透明化する。
+            ctx.fillStyle = T().bg;
+            ctx.fillRect(0, 0, out.width, out.height);
+            ctx.drawImage(srcCanvas, 0, 0);
+            vscode.postMessage({ type: 'exportPng', dataUrl: out.toDataURL('image/png') });
+          } catch (e) {
+            console.error('PNG export failed:', e);
+          } finally {
+            cleanup();
+          }
+        });
+      });
+    } catch (e) {
+      console.error('PNG export failed:', e);
+      cleanup();
     }
   });
 
@@ -673,7 +1103,7 @@
     if (!nodes) return;
     nodes.update(nodes.getIds().map(function (id) {
       var n  = nodes.get(id);
-      var fc = (n.font && n.font.color) ? n.font.color : '#2d3436';
+      var fc = (n.font && n.font.color) ? n.font.color : T().nodeFontDefault;
       return { id: id, font: { size: canvasFontSize, face: 'monospace', color: fc } };
     }));
   }
@@ -787,12 +1217,43 @@
   // matchSet を外スコープで保持し、keydown ハンドラでの全スキャン再実行を廃止する。
   var matchSet = new Set();
 
+  // 検索ヒットのハイライト塗り直し。searchBox の input ハンドラ と repaintTheme で共有する。
+  // matchSet の中身(どのノードがヒットしたか)は再計算せず、色だけを塗り直す。
+  function applySearchHighlight() {
+    nodes.update(nodes.getIds().map(function (id) {
+      if (matchSet.has(id)) {
+        var d = defaultNodeColors[id] || {};
+        return { id: id, color: d.color, font: makeFont(T().nodeFontDefault) };
+      }
+      return { id: id, color: { background: T().hopHiddenBg, border: T().hopHiddenBorder }, font: makeFont(T().searchDimFont) };
+    }));
+  }
+
   searchBox.addEventListener('input', function () {
     searchHitIndex = -1; // 入力変更時はリセット
     matchSet = new Set();
     if (!nodes) return;
     var q = this.value.trim().toLowerCase();
     if (!q) { resetAll(); return; }
+    // 検索はノード選択・ホップフィルタとは独立したモードとして扱う。
+    // 選択中に検索を始めると、ノード色だけが検索結果色(マッチ=元色/非マッチ=グレー)に
+    // 上書きされる一方、エッジの色・太さは選択時のまま取り残され、
+    // 「ノードは検索結果色なのに線だけ前の選択状態のまま」というチグハグな表示になっていた。
+    // そのため、色付けの前に選択状態(ノード選択・ホップフィルタ表示)を明示的にクリアする。
+    if (currentNode !== null) {
+      currentNode          = null;
+      connectedEdgesOfNode = new Set();
+      _hadSelection         = false;
+      pendingSourceNodeId  = null;
+      if (network) network.unselectAll();
+      document.getElementById('hop-panel').style.display = 'none';
+      document.querySelectorAll('.hop-btn').forEach(function (b) { b.classList.remove('active'); });
+      if (edges) {
+        edges.update(edges.getIds().map(function (id) {
+          return { id: id, color: { color: T().edgeNormal, opacity: 0.8 }, width: 1 };
+        }));
+      }
+    }
     Object.keys(nodeInfoMap).forEach(function (id) {
       var info    = nodeInfoMap[id];
       var matched = false;
@@ -810,13 +1271,7 @@
       }
       if (matched) matchSet.add(id);
     });
-    nodes.update(nodes.getIds().map(function (id) {
-      if (matchSet.has(id)) {
-        var d = defaultNodeColors[id] || {};
-        return { id: id, color: d.color, font: makeFont('#2d3436') };
-      }
-      return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#dddddd') };
-    }));
+    applySearchHighlight();
   });
 
   searchBox.addEventListener('keydown', function (e) {
@@ -853,7 +1308,18 @@
     // ノードクリック時は接続・非接続エッジ両方のスタイルが変わるため、
     // 選択があった場合は必ず全エッジをリセットする。
     // 一度もノードを選択していない場合（Esc 連打など）はスキップして最適化する。
-    var prevHadSelection = _hadSelection;
+    //
+    // _hadSelection は「自前のハイライト処理(onNetworkClickの通常クリック)を実行したか」
+    // だけを表すフラグで、次の2ケースでは true にならないまま vis-network 側の
+    // ネイティブな選択状態(エッジの色/ノードの枠太さ等)が変化してしまっていた:
+    //   ケースA: エッジを直接クリックした場合(params.nodes.length===0 のため resetAll直行)
+    //   ケースB: Ctrl/Cmd+クリックでソースへジャンプした場合(即returnのため_hadSelection未更新)
+    // これらを取りこぼさないよう、_hadSelection に加えて vis-network 側に実際に
+    // 選択されているものが無いかも判定に使う。
+    // getSelectedNodes()/getSelectedEdges() は unselectAll() を呼んだ後は必ず空になるため、
+    // 判定は unselectAll() を呼ぶ前に行うこと。
+    var prevHadSelection = _hadSelection ||
+      (network && (network.getSelectedNodes().length > 0 || network.getSelectedEdges().length > 0));
     currentNode          = null;
     connectedEdgesOfNode = new Set();
     _hadSelection        = false;
@@ -871,24 +1337,18 @@
     if (nodes) {
       if (preserveSearch && matchSet.size > 0) {
         // 検索ハイライト色を維持したままノード選択だけ外す
-        nodes.update(nodes.getIds().map(function (id) {
-          if (matchSet.has(id)) {
-            var d = defaultNodeColors[id] || {};
-            return { id: id, color: d.color, font: makeFont('#2d3436') };
-          }
-          return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#dddddd') };
-        }));
+        applySearchHighlight();
       } else {
         nodes.update(nodes.getIds().map(function (id) {
           var d = defaultNodeColors[id] || {};
-          return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
+          return { id: id, color: d.color, font: makeFont(T().nodeFontDefault) };
         }));
       }
     }
     // 前回選択がなければエッジは変更されていないのでスキップ（最適化）
     if (edges && prevHadSelection) {
       edges.update(edges.getIds().map(function (id) {
-        return { id: id, color: { color: '#aaaaaa', opacity: 0.8 }, width: 1 };
+        return { id: id, color: { color: T().edgeNormal, opacity: 0.8 }, width: 1 };
       }));
     }
     document.getElementById('hop-panel').style.display = 'none';
@@ -903,7 +1363,44 @@
     }
   }
 
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') resetAll(); });
+  // テーマのライブ切替(callatlas.colorTheme: auto)専用の再描画。
+  // resetAll() と違い、検索・選択・Hop filterの状態は一切変更せず、
+  // 「現在どの状態を表示中か」に応じて対応するハイライト処理を色だけ再実行する。
+  function repaintTheme() {
+    if (!nodes) return;
+    if (currentNode !== null) {
+      // ノード選択中(Hop filter適用有無を問わない)。
+      // 検索中に既存のマッチ候補を選択した場合(matchSetは選択時にクリアされない)も、
+      // UI上の実際の優先順位(選択 > 検索)に合わせて選択ハイライトを優先する。
+      var activeBtn = document.querySelector('.hop-btn.active');
+      if (activeBtn) {
+        applyHopFilter(activeBtn.dataset.hop === 'all' ? null : parseInt(activeBtn.dataset.hop, 10));
+      } else {
+        applySelectionHighlight(currentNode);
+      }
+    } else if (matchSet.size > 0) {
+      // 検索結果ハイライト中(選択なし)
+      applySearchHighlight();
+    } else {
+      // 何も選択・検索していない通常状態
+      nodes.update(nodes.getIds().map(function (id) {
+        var d = defaultNodeColors[id] || {};
+        return { id: id, color: d.color, font: makeFont(T().nodeFontDefault) };
+      }));
+      if (edges) {
+        edges.update(edges.getIds().map(function (id) {
+          return { id: id, color: { color: T().edgeNormal, opacity: 0.8 }, width: 1 };
+        }));
+      }
+    }
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var modal = document.getElementById('warning-modal');
+    if (modal.style.display === 'flex') { closeWarningModal(); return; }
+    resetAll();
+  });
 
   // ─────────────────────────────────────────────────────────────────────────
   // ファイル凡例
@@ -916,7 +1413,7 @@
       var name = item.file.replace(/\\/g, '/').split('/').pop();
       var row  = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:3px;font-size:11px;cursor:default;';
-      row.title = escapeAttr(item.file);
+      row.title = item.file; // C1修正: .title はDOMプロパティなのでHTMLエスケープ不要
       var dot  = document.createElement('span');
       // cssText への直接連結は CSS インジェクションの経路になるため個別プロパティ代入にする
       dot.style.width        = '10px';
@@ -926,7 +1423,7 @@
       dot.style.background   = item.color;
       dot.style.border       = '1.5px solid ' + item.border;
       var label = document.createElement('span');
-      label.style.color        = '#2d3436';
+      label.style.color        = 'var(--atlas-text)';
       label.style.overflow     = 'hidden';
       label.style.textOverflow = 'ellipsis';
       label.style.whiteSpace   = 'nowrap';

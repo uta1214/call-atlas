@@ -14,7 +14,6 @@
  */
 
 import * as path from 'path';
-import * as fs   from 'fs';
 import * as vscode from 'vscode';
 import { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEntry } from './types';
 
@@ -23,7 +22,10 @@ import { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEntry }
 // utils から import すると循環依存になる。
 function normalizeFsPath(p: string): string {
   const n = path.normalize(p);
-  return process.platform === 'win32' ? n.toLowerCase() : n;
+  // #2修正: utils.ts の normalizeFsPath と同じ理由(macOS/darwin も大文字小文字非依存)。
+  // 循環import回避のためこのファイルにも同一内容を複製しているが、片方だけ更新される
+  // リスクは既知(utils.ts側のコメント参照)。両方合わせて修正する。
+  return process.platform !== 'linux' ? n.toLowerCase() : n;
 }
 
 export type { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEntry };
@@ -40,7 +42,6 @@ export type { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEn
 interface GraphCacheEntry   { data: GraphData;                     timestamp: number; }
 interface TagsCacheEntry    {
   tags:           Map<string, GtagEntry[]>;
-  ambiguousNames: string[];
   scopeMap:       Map<string, ScopeMapEntry>;
   timestamp:      number;
 }
@@ -73,6 +74,18 @@ const GTAGS_FALSE_TTL           = 30_000;        // 30 秒
 
 export class CacheManager {
 
+  // ── 世代カウンタ (レースコンディション対策) ───────────────────────────
+  // invalidateFile / invalidateAll のたびに1つ進む。
+  // 「非同期処理の開始時に読んだ世代」と「書き込み直前の世代」を呼び出し側
+  // (callGraphBuilder.ts / collectGtagsCached / ensureGtagsDbInner) で比較し、
+  // 処理中に無効化が発生していた場合は書き込みをスキップするために使う。
+  // wsRoot/キー単位ではなくグローバルに1つだけ持つ設計のため、無関係な
+  // ファイル保存でも書き込みがスキップされることがあるが、これは安全側
+  // (キャッシュミスが増えるだけで、古いデータが焼き付くことはない)。
+  private _generation = 0;
+
+  getGeneration(): number { return this._generation; }
+
   // ── グラフ結果キャッシュ (FIFO 上限 20 件 + TTL 5 分) ──────────────────
   private readonly _graph = new Map<string, GraphCacheEntry>();
 
@@ -80,7 +93,11 @@ export class CacheManager {
     const e = this._graph.get(key);
     if (!e) return undefined;
     if (Date.now() - e.timestamp >= CACHE_TTL_MS) { this._graph.delete(key); return undefined; }
-    return e.data;
+    // 浅いコピーを返す: 呼び出し元(extension.ts の buildAndOutput() 等)は
+    // 返り値の kind/subject を in-place で書き換えるため、キャッシュ実体をそのまま返すと
+    // 内部状態が呼び出し元の都合で汚染されてしまう。nodes/edges/errors 配列自体は
+    // 呼び出し元が変更しない前提のため、トップレベルのみの浅いコピーで十分。
+    return { ...e.data };
   }
 
   setGraph(key: string, data: GraphData): void {
@@ -212,12 +229,19 @@ export class CacheManager {
    * ファイル内容・構造変更時の部分無効化。
    *
    * graphCache:
-   *   - file / func / path キー: セグメント[1] が変更ファイルと完全一致するエントリを削除
+   *   - file / func / path キー: どのファイルが変更されても無条件で削除する。
+   *     A3修正: 以前は「セグメント[1]が変更ファイルと完全一致する場合のみ削除」だったが、
+   *     コールグラフは呼び出し先・呼び出し元として他ファイルにも依存するため、
+   *     依存先ファイルの編集がキャッシュに反映されない問題があった。
+   *     invalidateFile はファイルウォッチャーから C/C++ ファイルの変更時のみ呼ばれるため、
+   *     ここでは常に file/func/path 全体を消去してよい
+   *     (gtags のみキャッシュ対象であり高速なため、体感への影響は小さい)。
    *   - workspace キー: セグメント[1] が '\x01' 区切りの全 wsRoot リスト。
    *     いずれかの wsRoot 配下なら削除（マルチルート対応）
    *
-   * tagsCache / lazyTagCache / lazyScopeCache:
-   *   変更ファイルが属する wsRoot のエントリのみ削除
+   * tagsCache / lazyTagCache / lazyScopeCache / gtagsUpdateTs:
+   *   変更ファイルが属する wsRoot のエントリのみ削除(gtagsUpdateTsも同時に削除し、
+   *   次回は必ず global -u を実行させる。TTL 内のスキップによる stale データ防止)
    *   どの wsRoot にも属さない場合は全クリア（安全側）
    *
    * filesCache / folderFilesCache:
@@ -228,6 +252,11 @@ export class CacheManager {
    *   シンボリックリンクの向き先変更に対応するため常に全クリア。
    */
   invalidateFile(fsPath: string): void {
+    // レースコンディション対策: 世代を進める。
+    // このメソッド呼び出し以降に「処理開始時の世代」と比較する側は、
+    // 呼び出し前から実行中だった非同期処理の結果を書き込まなくなる。
+    this._generation++;
+
     const norm = normalizeFsPath(fsPath);
 
     // ── graphCache ──────────────────────────────────────────────────────
@@ -244,17 +273,21 @@ export class CacheManager {
         });
         if (hit) this._graph.delete(key);
       } else {
-        // file / func / path: segments[1] = fsPath
-        const keyPath = segments[1] ?? '';
-        if (normalizeFsPath(keyPath) === norm) this._graph.delete(key);
+        // file / func / path: 呼び出し先・呼び出し元として他ファイルにも依存しうるため、
+        // 変更ファイルとの一致を問わず無条件で削除する。
+        this._graph.delete(key);
       }
     }
 
-    // ── tagsCache / lazyTagCache / lazyScopeCache ───────────────────────
+    // ── tagsCache / lazyTagCache / lazyScopeCache / gtagsUpdateTs ───────
+    // _gtagsUpdateTs もここで一緒に無効化しないと、TTL(5分)内の再解析時に
+    // ensureGtagsDb が「まだ新しい」と誤判定して global -u をスキップし、
+    // 編集前の GTAGS データのままグラフが返ってしまう。
     const allWsRoots = new Set([
       ...this._tags.keys(),
       ...this._lazyTags.keys(),
       ...this._lazyScopes.keys(),
+      ...this._gtagsUpdateTs.keys(),
     ]);
 
     const affected = [...allWsRoots].filter(wsRoot => {
@@ -267,11 +300,13 @@ export class CacheManager {
       this._tags.clear();
       this._lazyTags.clear();
       this._lazyScopes.clear();
+      this._gtagsUpdateTs.clear();
     } else {
       for (const wsRoot of affected) {
         this._tags.delete(wsRoot);
         this._lazyTags.delete(wsRoot);
         this._lazyScopes.delete(wsRoot);
+        this._gtagsUpdateTs.delete(wsRoot);
       }
     }
     // _files（ファイル URI リスト）はファイル内容変更では無効化不要。
@@ -286,6 +321,11 @@ export class CacheManager {
    * 拡張機能の deactivate 時・テスト間のリセットに使用する。
    */
   invalidateAll(): void {
+    // レースコンディション対策: invalidateFile と同様に世代を進める。
+    // これがないと、invalidateAll でクリアした直後に、それより前から
+    // 実行中だった処理が古い結果を書き戻してクリアを巻き戻してしまう。
+    this._generation++;
+
     this._graph.clear();
     this._tags.clear();
     this._files.clear();
@@ -303,6 +343,11 @@ export class CacheManager {
    * filesCache / folderFilesCache クリア専用 API。
    */
   invalidateFileList(): void {
+    // findFilesCached() の世代チェックがこのメソッド単体の呼び出しにも
+    // 反応できるよう、こちらでも世代を進めておく(現状の呼び出し元では
+    // 常に invalidateFile と同時に呼ばれるため実害はないが、将来単体で
+    // 呼ばれるようになった場合の取りこぼしを防ぐ)。
+    this._generation++;
     this._files.clear();
     this._folderFiles.clear();
   }

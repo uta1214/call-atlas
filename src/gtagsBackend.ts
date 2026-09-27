@@ -18,11 +18,11 @@ import {
   MAX_SOURCE_LINES,
 } from './types';
 import {
-  normalizeFsPath, splitEdges, fnv1a32, delay,
-  getWorkspaceRoots, getWorkspaceRootForFile, hasCppSourceExtension,
-  findScopeMapEntry, findScopeAtLine,
+  normalizeFsPath, splitEdges,
+  getWorkspaceRoots, getWorkspaceRootForFile,
+  findScopeMapEntry, findScopeAtLine, touchScopeMap,
   isLikelyFuncDef, makeGtagsNodeId, parseGtagsNodeId, escapeRegexForGlobal,
-  NodeIndex, Pct, checkCancellation, CC_SOURCE_EXTENSIONS,
+  Pct, checkCancellation, CC_SOURCE_EXTENSIONS, EXCLUDE_DIRS,
 } from './utils';
 export type { GraphData };
 
@@ -31,8 +31,15 @@ export type { GraphData };
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CC_ALL_GLOB       = '**/*.{c,cpp,cc,cxx,cu,cuh,h,hpp,hxx}';
-const EXCLUDE_GLOB      = '{**/node_modules/**,**/.git/**,**/build/**,**/dist/**,**/.cache/**,**/out/**,**/__pycache__/**,**/.venv/**,**/.mypy_cache/**}';
-const GTAGS_UPDATE_TTL  = 5 * 60_000;  // ms
+// N-fix: 以前は EXCLUDE_GLOB をここに独立したリテラルとして持っていたが、
+// utils.ts の EXCLUDE_DIRS(CMake/vendor 系ディレクトリ等を含む)と内容が乖離していた
+// (utils.ts のコメントが警告していた「別々に定義すると片方だけ更新される」状態が
+//  実際に発生していた: __pycache__/.venv/.mypy_cache は EXCLUDE_GLOB のみ、
+//  CMakeFiles/_build/_deps/cmake-build-*/.ccls-cache/vendor/.deps は EXCLUDE_DIRS のみ)。
+// EXCLUDE_DIRS から動的生成することで一元化し、以後の乖離を構造的に防ぐ。
+// (__pycache__ 等 Python 系ディレクトリも合わせて EXCLUDE_DIRS 側に統合する)
+const EXCLUDE_GLOB      = `{${[...EXCLUDE_DIRS].map(d => `**/${d}/**`).join(',')}}`;
+const GTAGS_UPDATE_TTL_DEFAULT = 5 * 60_000;  // ms (callatlas.gtagsUpdateInterval 未設定時のフォールバック)
 const GLOBAL_RX_PARALLEL = Math.max(4, Math.min(os.cpus().length * 2, 32));
 const WORKSPACE_FILES_KEY = '__workspace__';
 
@@ -69,8 +76,13 @@ export async function gtagsAvailable(): Promise<boolean> {
 export async function findFilesCached(): Promise<vscode.Uri[]> {
   const cached = cache.getFiles(WORKSPACE_FILES_KEY);
   if (cached) return cached;
+  // レースコンディション対策: findFiles() 実行中に invalidateFileList()
+  // (ファイル作成/削除時) が発生していた場合、その完了後の結果を無条件で
+  // 書き戻すと無効化が巻き戻ってしまう。他の3箇所(グラフ結果・gtagsタグ・
+  // GTAGS更新時刻)と同じ生成カウンタ方式で塞ぐ。
+  const genAtStart = cache.getGeneration();
   const uris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
-  cache.setFiles(WORKSPACE_FILES_KEY, uris);
+  if (cache.getGeneration() === genAtStart) cache.setFiles(WORKSPACE_FILES_KEY, uris);
   return uris;
 }
 
@@ -82,35 +94,50 @@ export async function findFilesCached(): Promise<vscode.Uri[]> {
 export async function collectGtagsCached(wsRoot: string): Promise<{
   tags:           Map<string, GtagEntry[]>;
   lineCache:      Map<string, string[]>;
-  ambiguousNames: string[];
   scopeMap:       Map<string, ScopeMapEntry>;
+  /** 今回の呼び出しで新たに解決できなかった参照の件数。キャッシュヒット時は常に0
+   *  (新規計算していないため)。呼び出し元は0より大きい場合のみ警告する。 */
+  droppedRefCount: number;
 }> {
   const cached = cache.getTags(wsRoot);
   if (cached) {
     return {
-      tags:           cached.tags,
-      lineCache:      new Map(),
-      ambiguousNames: cached.ambiguousNames,
-      scopeMap:       cached.scopeMap,
+      tags:            cached.tags,
+      lineCache:       new Map(),
+      scopeMap:        cached.scopeMap,
+      droppedRefCount: 0,
     };
   }
-  const allUris  = await findFilesCached();
-  // findFilesCached() は全ワークスペースのファイルを返すため、
-  // cwd: wsRoot で実行する collectGtags のフォールバックパスに渡す前に
-  // wsRoot 配下のファイルのみに絞り込む。
-  const wsRootNorm = normalizeFsPath(wsRoot);
-  const wsUris     = allUris.filter(u => {
-    const n = normalizeFsPath(u.fsPath);
-    return n === wsRootNorm || n.startsWith(wsRootNorm + '/') || n.startsWith(wsRootNorm + path.sep);
-  });
-  const result   = await collectGtags(wsUris.map(u => u.fsPath), wsRoot);
+  // N4修正: ファイル列挙(findFilesCached)は collectGtags のフォールバック時にしか
+  // 使わないため、即時実行せず関数として渡す(通常経路では一度も評価されない)。
+  const getFiles = async (): Promise<string[]> => {
+    const allUris    = await findFilesCached();
+    // findFilesCached() は全ワークスペースのファイルを返すため、
+    // cwd: wsRoot で実行する collectGtags のフォールバックパスに渡す前に
+    // wsRoot 配下のファイルのみに絞り込む。
+    const wsRootNorm = normalizeFsPath(wsRoot);
+    return allUris.filter(u => {
+      const n = normalizeFsPath(u.fsPath);
+      return n === wsRootNorm || n.startsWith(wsRootNorm + '/') || n.startsWith(wsRootNorm + path.sep);
+    }).map(u => u.fsPath);
+  };
+  // レースコンディション対策: collectGtags() 実行中に invalidateFile/invalidateAll
+  // が発生していた場合、その完了後の結果を無条件でキャッシュに書き戻すと、
+  // 無効化が黙って巻き戻ってしまう(古いタグが最大 TAGS_CACHE_TTL_MS 生き残る)。
+  // 開始時点の世代を記録し、書き込み直前に変化していないか確認する。
+  const genAtStart = cache.getGeneration();
+  const result   = await collectGtags(getFiles, wsRoot);
   const scopeMap = buildGtagsScopeMap(result.tags);
-  cache.setTags(wsRoot, {
-    tags:           result.tags,
-    ambiguousNames: result.ambiguousNames,
-    scopeMap,
-    timestamp:      Date.now(),
-  });
+  // 防御的修正: タグが1件も取れなかった場合はキャッシュしない。
+  // (DB未生成直後や一時的な取得失敗の空結果を TTL 5分間キャッシュし続けると、
+  //  その間ずっと「No tags found」等の誤ったエラーが再現し続けてしまうため)
+  if (result.tags.size > 0 && cache.getGeneration() === genAtStart) {
+    cache.setTags(wsRoot, {
+      tags:           result.tags,
+      scopeMap,
+      timestamp:      Date.now(),
+    });
+  }
   return { ...result, scopeMap };
 }
 
@@ -144,12 +171,61 @@ function spawnErrorMessage(cmd: string, err: unknown): string {
 }
 
 /**
+ * B12修正: 「No tags found」で投げる前に、ensureGtagsDb 等が errs に積んだ
+ * 警告(gtags未導入・DB更新失敗の詳細等)をエラーメッセージに含める。
+ * 以前は errs に実際の原因が入っていても throw のメッセージには反映されず、
+ * ユーザーには "No tags found" としか見えていなかった。
+ */
+function noTagsFoundError(baseMsg: string, errs: string[]): Error {
+  const detail = errs.length > 0 ? `\n${errs.slice(0, 3).join('\n')}` : '';
+  return new Error(`${baseMsg}${detail}`);
+}
+
+/**
+ * callatlas.gtagsUpdateInterval 設定を読み取り、
+ * ensureGtagsDb が使う「TTL(ms)」または 'off' に変換する。
+ *   'always' → 0 (常に global -u を実行)
+ *   '5'/'30'/'60' → 分 → ms
+ *   'off' → 自動更新しない
+ *   不正値/未設定 → デフォルト(5分)にフォールバック
+ */
+function getGtagsUpdateTtl(): number | 'off' {
+  const setting = vscode.workspace.getConfiguration('callatlas')
+    .get<string>('gtagsUpdateInterval', '5');
+  if (setting === 'off')    return 'off';
+  if (setting === 'always') return 0;
+  const minutes = Number(setting);
+  return (Number.isFinite(minutes) && minutes > 0) ? minutes * 60_000 : GTAGS_UPDATE_TTL_DEFAULT;
+}
+
+/**
+ * B16修正: 同一 wsRoot に対する ensureGtagsDb の同時実行を防ぐための
+ * 実行中 Promise の共有マップ。ワークスペース解析とファイル解析をほぼ同時に
+ * 実行した場合等、`gtags`/`global -u` が同一ディレクトリで二重起動されると
+ * 両プロセスが同時に DB ファイルへ書き込み、GTAGS が壊れる可能性がある。
+ * 2回目以降の呼び出しは新規プロセスを起動せず、1回目の完了を待つだけにする。
+ */
+const _ensureGtagsDbInFlight = new Map<string, Promise<string | undefined>>();
+
+/**
  * GTAGS が存在しなければ gtags を実行して DB 構築。
  * 存在する場合は global -u でインクリメンタル更新する。
- * GTAGS_UPDATE_TTL 以内の再実行は global -u をスキップして連続実行のオーバーヘッドを抑制する。
+ * callatlas.gtagsUpdateInterval 設定(デフォルト5分)以内の再実行は
+ * global -u をスキップして連続実行のオーバーヘッドを抑制する。'off' 指定時は
+ * 初回構築のみ行い、以降は自動更新しない(ユーザーが手動で gtags を実行する前提)。
  * 戻り値: 警告メッセージ（問題なければ undefined）。呼び出し元が errs に追加する。
  */
-async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
+export async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
+  const inFlight = _ensureGtagsDbInFlight.get(wsRoot);
+  if (inFlight) return inFlight;
+  const p = ensureGtagsDbInner(wsRoot).finally(() => {
+    _ensureGtagsDbInFlight.delete(wsRoot);
+  });
+  _ensureGtagsDbInFlight.set(wsRoot, p);
+  return p;
+}
+
+async function ensureGtagsDbInner(wsRoot: string): Promise<string | undefined> {
   // wsRoot が空文字列や相対パスの場合、意図しないディレクトリで
   // gtags が実行されるリスクがあるため早期リターンする。
   if (!wsRoot || !path.isAbsolute(wsRoot)) {
@@ -157,26 +233,37 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
   }
   const now = Date.now();
   if (fs.existsSync(path.join(wsRoot, 'GTAGS'))) {
+    const ttl = getGtagsUpdateTtl();
+    if (ttl === 'off') return undefined; // 自動更新オフ: 既存DBをそのまま使う
     const last = cache.getGtagsUpdateTs(wsRoot);
-    if (now - last < GTAGS_UPDATE_TTL) return undefined; // TTL 内はスキップ
+    if (now - last < ttl) return undefined; // TTL 内はスキップ
+    // レースコンディション対策: global -u / gtags 実行中に invalidateFile が
+    // _gtagsUpdateTs.delete(wsRoot) を実行していた場合、その完了後に
+    // 無条件で setGtagsUpdateTs(wsRoot, now) すると「更新前の時刻」で
+    // タイムスタンプが復活し、次回以降 global -u が誤ってスキップされ続ける
+    // (GTAGS 自体が編集内容を反映しないまま使われ続ける、最も深刻なパターン)。
+    // 実行開始時点の世代を記録し、書き込み直前に変化していないか確認する。
+    const genAtStart = cache.getGeneration();
     try {
       await execFileAsync('global', ['-u'], { cwd: wsRoot, timeout: 120_000 });
-      cache.setGtagsUpdateTs(wsRoot, now);
+      if (cache.getGeneration() === genAtStart) cache.setGtagsUpdateTs(wsRoot, now);
     } catch (updateErr) {
       try {
         await runGtagsWithDotfilesCompat(wsRoot);
-        cache.setGtagsUpdateTs(wsRoot, now);
+        if (cache.getGeneration() === genAtStart) cache.setGtagsUpdateTs(wsRoot, now);
       } catch (rebuildErr) {
         return spawnErrorMessage('global -u / gtags rebuild', rebuildErr);
       }
     }
   } else {
+    // 初回構築の場合も同様に世代を記録・比較する。
+    const genAtStart = cache.getGeneration();
     try {
       await runGtagsWithDotfilesCompat(wsRoot);
     } catch (initErr) {
       return spawnErrorMessage('gtags', initErr);
     }
-    cache.setGtagsUpdateTs(wsRoot, now);
+    if (cache.getGeneration() === genAtStart) cache.setGtagsUpdateTs(wsRoot, now);
   }
   return undefined;
 }
@@ -317,11 +404,12 @@ async function prefetchFileLines(files: readonly string[], cache: Map<string, st
  */
 async function runGlobalXAll(
   wsRoot: string
-): Promise<Array<{ name: string; line: number; file: string; sourceLine: string }>> {
+): Promise<{ entries: Array<{ name: string; line: number; file: string; sourceLine: string }>; droppedCount: number }> {
   const { stdout } = await execFileAsync('global', ['-x', '-e', '.'], {
     cwd: wsRoot, maxBuffer: 256 * 1024 * 1024, timeout: 120_000,
   });
-  return stdout.split('\n').flatMap(raw => {
+  let droppedCount = 0;
+  const entries = stdout.split('\n').flatMap(raw => {
     const trimmed = raw.trimEnd();
     if (!trimmed) return [];
     const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
@@ -332,9 +420,17 @@ async function runGlobalXAll(
     // name にセパレータが混入するとパースが破壊されるためスキップする
     if (!name || name.includes('\x00') || name.includes('|||')) return [];
     const file = sanitizeToWsRoot(fileStr, wsRoot);
-    if (!file) return [];
+    if (!file) {
+      // N5修正: global -x の出力を空白で分割しているため、フォルダ名に空白が
+      // 含まれるパス(例: "src/My Module/mod.c")は "src/My" のように途中で
+      // 切れてしまい、実在しないパスとして静かに捨てられていた
+      // (これまでは警告なし)。件数だけでも数えて呼び出し元で警告できるようにする。
+      droppedCount++;
+      return [];
+    }
     return [{ name, line, file, sourceLine }];
   });
+  return { entries, droppedCount };
 }
 
 /**
@@ -346,18 +442,26 @@ async function runGlobalXAll(
  * resolveCallee() が callerFile 優先で解決する。
  */
 async function collectGtags(
-  files: string[],
+  getFiles: () => Promise<string[]>,
   wsRoot: string
-): Promise<{ tags: Map<string, GtagEntry[]>; lineCache: Map<string, string[]>; ambiguousNames: string[] }> {
+): Promise<{ tags: Map<string, GtagEntry[]>; lineCache: Map<string, string[]>; droppedRefCount: number }> {
   const lineCache = new Map<string, string[]>(); // オンデマンド読み込み用（空で返す）
 
   // 高速パス: global -x -e '.' 一括取得
   type RawEntry = { name: string; line: number; file: string; sourceLine: string };
   let rawEntries: RawEntry[];
+  let droppedRefCount = 0;
   try {
-    rawEntries = await runGlobalXAll(wsRoot);
+    const r = await runGlobalXAll(wsRoot);
+    rawEntries      = r.entries;
+    droppedRefCount = r.droppedCount;
   } catch {
     // フォールバック: per-file global -f
+    // N4修正: ファイル一覧(ワークスペース全体の列挙)は、この失敗時にしか使わないため、
+    // 呼び出し元から関数として渡してもらい、実際に必要になった時だけ評価する。
+    // 通常(高速パスが成功する)は一度も呼ばれず、大規模プロジェクトでの
+    // 無駄な列挙が無くなる。
+    const files = await getFiles();
     const perFileResults: Array<{ name: string; line: number; file: string }> = [];
     const perFileConcurrent = Math.min(16, files.length);
     for (let i = 0; i < files.length; i += perFileConcurrent) {
@@ -378,8 +482,7 @@ async function collectGtags(
     rawMap.get(e.name)!.push(e);
   }
 
-  const tags           = new Map<string, GtagEntry[]>();
-  const ambiguousNames: string[] = [];
+  const tags = new Map<string, GtagEntry[]>();
 
   // sourceLine が空のエントリ（per-file フォールバック時）のファイルを事前に並列プリフェッチ。
   // 後続の readFileLinesCached がキャッシュヒットするよう先に読み込んでおく。
@@ -394,9 +497,6 @@ async function collectGtags(
   }
 
   for (const [name, candidates] of rawMap) {
-    const distinctFiles = new Set(candidates.map(c => c.file));
-    if (distinctFiles.size > 1) ambiguousNames.push(name);
-
     const entries: GtagEntry[] = candidates.map(cand => {
       // sourceLine が空 (per-file fallback) の場合のみファイルを読む
       let sourceLine = cand.sourceLine;
@@ -408,7 +508,7 @@ async function collectGtags(
     });
     tags.set(name, entries);
   }
-  return { tags, lineCache, ambiguousNames };
+  return { tags, lineCache, droppedRefCount };
 }
 
 /**
@@ -442,6 +542,7 @@ function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMa
       if (!byName.has(s.name)) byName.set(s.name, s);
     }
     scopeMap.set(fp, { list, byName });
+    touchScopeMap(scopeMap);
   }
   return scopeMap;
 }
@@ -451,6 +552,60 @@ function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMa
  * knownTags に含まれる呼び出し先（自己再帰除外）を返す。
  * 文字列リテラル内の誤検出を除去し、C++11 RAW文字列リテラルにも対応する。
  */
+/**
+ * N2修正: 「型 名前(...)」の形をした行(前方宣言・クラス内メンバ宣言等)を
+ * 呼び出しとして数えないための判定。呼び出し箇所の識別子直前の文字列(prefix)を見て、
+ * 「型名らしきトークン列で終わっている」場合は宣言とみなす。
+ * ヒューリスティックであり、`a * foo(3);` のように「型のように見える式」は
+ * 宣言と誤判定しうる(既知の限界。実コードではほぼ出ない形)。
+ */
+const NON_TYPE_WORDS = new Set([
+  'return', 'else', 'case', 'goto', 'do', 'sizeof', 'throw', 'new', 'delete', 'typeof', 'alignof',
+  'co_return', 'co_yield', 'co_await', 'and', 'or', 'not', 'xor', 'defined',
+]);
+
+function isDeclarationPrefix(prefix: string): boolean {
+  if (!prefix.trim()) return false;                          // 文頭の呼び出し foo(...)
+  // 直前の修飾(Ns:: / Class::)を外す。修飾だけが前にある場合は「修飾付きの呼び出し」
+  const q = prefix.replace(/(?:[A-Za-z_]\w*\s*::\s*)+$/, '');
+  if (!q.trim() || !/[\s*&]$/.test(q)) return false;
+  // B3修正: "if (a &&\n    b && foo(1))" のような複数行にまたがる論理AND条件の
+  // 継続行では、prefix が "b && " のようになり、"T&& foo(...)"(右辺値参照を返す
+  // 関数宣言)と区別がつかず宣言と誤判定してしまう(&&もこの後の判定を素通りしてしまう)。
+  // 論理ANDの継続行の方が実務上圧倒的に多く現れ、誤判定時の実害も「宣言をcallとして
+  // 拾ってしまう」程度で済む(本物のcallを取りこぼす方が実害が大きい)ため、
+  // && を含む場合は宣言ではないと判定する。
+  if (/&&/.test(q)) return false;
+  const t = q.replace(/<[^<>()=;]*>/g, '');                  // テンプレート引数を除去
+  if (/(?<!:):(?!:)/.test(t)) return false;                  // ラベル(retry: / default: / case N:)は宣言ではない
+  if (!/^[A-Za-z_][\w:\s*&~]*$/.test(t.trim())) return false; // 演算子・括弧・代入等 → 式の一部
+  const tokens = t.match(/[A-Za-z_]\w*/g) ?? [];
+  return tokens.length > 0 && !tokens.some(w => NON_TYPE_WORDS.has(w));
+}
+
+function isDeclarationRef(srcLine: string, name: string): boolean {
+  const m = new RegExp('\\b' + escapeRegexForGlobal(name) + '\\s*\\(').exec(srcLine);
+  return m ? isDeclarationPrefix(srcLine.slice(0, m.index)) : false;
+}
+
+// バグ修正: C++14 の桁区切り文字(digit separator, 例: 1'024, 0x1234'5678)を
+// 文字リテラルの開始と誤認しないための判定。
+// 以前は extractCallsFromLines() 内で '\'' を見つけると常に「次の unescaped '\'' まで
+// 読み飛ばす」文字リテラル処理に入っていたため、桁区切りが奇数個(1個)しかない数値
+// (例: 65'536)を含む行では閉じクォートが見つからず行末までを丸ごと読み飛ばしてしまい、
+// 同じ行より後方にある関数呼び出しが検出できなくなっていた
+// (例: `size_t n = 65'536; foo(n);` の foo(n) が消える)。
+// '\'' の直前・直後が両方とも16進数字([0-9a-fA-F])であれば桁区切りとみなして
+// スキップする。文字リテラルの開始('0' 等)は通常、直前に演算子・空白・括弧等が来て
+// 数字が直接前置されることはない(数字が直接前置される書き方はそもそもC++として
+// 構文が成立しない)ため、この判定で本物の文字リテラルを誤検知することはない。
+const HEX_DIGIT_RE = /[0-9a-fA-F]/;
+function isDigitSeparatorApostrophe(line: string, idx: number): boolean {
+  const prev = idx > 0              ? line[idx - 1] : '';
+  const next = idx + 1 < line.length ? line[idx + 1] : '';
+  return HEX_DIGIT_RE.test(prev) && HEX_DIGIT_RE.test(next);
+}
+
 function extractCallsFromLines(
   lines: string[], start: number, end: number,
   selfName: string, knownTags?: Set<string>
@@ -520,6 +675,10 @@ function extractCallsFromLines(
           else if (line[j] === '"') { j++; break; }
           else { j++; }
         }
+      } else if (ch === "'" && isDigitSeparatorApostrophe(line, j)) {
+        // C++14 桁区切り文字: 文字リテラルには入らず読み飛ばすだけにする
+        // (processed には含めない。区切りの有無は識別子境界に影響しないため)。
+        j++;
       } else if (ch === "'") {
         // 文字リテラル: 次の unescaped ' まで読み飛ばす
         j++;
@@ -545,7 +704,9 @@ function extractCallsFromLines(
     while ((m = re.exec(processedStr)) !== null) {
       const callee = m[1];
       // knownTags が指定されている場合のみフィルタ (省略時は全候補を返す)
-      if (callee !== selfName && (!knownTags || knownTags.has(callee))) callees.add(callee);
+      // N2修正: 「型 名前(...)」の形の宣言・前方宣言は呼び出しではないため除外する
+      if (callee !== selfName && (!knownTags || knownTags.has(callee))
+          && !isDeclarationPrefix(processedStr.slice(0, m.index))) callees.add(callee);
     }
   }
   return callees;
@@ -570,19 +731,104 @@ function resolveCalleeScope(
 
 
 /**
+ * resolveCallee() が「自信のない解決」をした場合に記録する情報。
+ * (優先順位①=callerFileと同一ファイル+isFunc、で確実に決着できず、
+ *  複数ファイルにまたがる候補からヒューリスティックに選んだ場合のみ記録される)
+ */
+interface UncertainResolution {
+  name:       string;
+  callerFile: string;
+  candidates: GtagEntry[];
+  picked:     GtagEntry;
+}
+
+/**
+ * 複数の UncertainResolution を集約して警告メッセージ(最大1件)に変換する。
+ * 同一 (callerFile, name) の重複はBFS中に何度も記録されうるため、表示前に去重する。
+ */
+function formatUncertainResolutions(uncertain: UncertainResolution[]): string[] {
+  if (uncertain.length === 0) return [];
+  const seen = new Set<string>();
+  const unique: UncertainResolution[] = [];
+  for (const u of uncertain) {
+    const key = `${u.callerFile}\x00${u.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(u);
+  }
+  const describe = (u: UncertainResolution): string => {
+    const others = u.candidates
+      .filter(c => c !== u.picked)
+      .map(c => `${path.basename(c.file)}:${c.line}`)
+      .join(', ');
+    return `${path.basename(u.callerFile)} → ${u.name} (chose ${path.basename(u.picked.file)}:${u.picked.line}; other candidates: ${others})`;
+  };
+  const preview = unique.slice(0, 5).map(describe).join(' / ');
+  const suffix  = unique.length > 5 ? ` and ${unique.length - 5} more` : '';
+  return [`[gtags] Uncertain call resolution for ${unique.length} call(s) ` +
+    `(same name in multiple files, caller not co-located with any of them): ${preview}${suffix}`];
+}
+
+/**
  * callee エントリを全候補から解決する。
  * 優先順位: 1. callerFile と同ファイル + isFunc（static 関数）
  *           2. 任意ファイルの isFunc
  *           3. フォールバック（先頭候補）
+ *
+ * 優先順位1はC言語の名前解決規則(static関数はそのファイルからしか呼べない)そのものなので
+ * 確実に正しい。優先順位2/3は単なるヒューリスティック(候補配列の順序依存)であり、
+ * 複数ファイルにまたがる同名候補が存在する状態でここに落ちた場合は、誤接続の可能性がある。
+ * uncertain を渡すと、その「自信のない解決」だけを記録する
+ * (単に同名が複数ファイルにあるだけでは記録しない。通常のクロスファイル呼び出しの
+ *  大半が該当してしまいノイズになるため)。
  */
+/**
+ * N1修正: 呼び出し元と同じファイルに候補が無い場合、以前は global -x の出力順
+ * (≒パスの辞書順)で最初の関数を無条件に採用していたため、build/ 配下のコピーや
+ * vendor の複製、別言語(C++)の同名関数が、正しい候補より先に選ばれることがあった
+ * (Path-Through Graphで本来の呼び出し元が消える、誤エッジが混入する等)。
+ * 「近さ」で順位付けする: ① 除外ディレクトリ(build/vendor等)配下の候補を後回し
+ * ② 呼び出し元ディレクトリからの距離が近い候補を優先 ③ C/C++の言語不一致を後回し
+ * ④ それでも決まらなければ従来通り出力順。
+ */
+function candidateRank(callerFile: string, cand: GtagEntry): [number, number, number] {
+  const CPP_EXT_RE = /\.(cpp|cc|cxx|c\+\+|hpp|hh|hxx|h\+\+|inl|ipp|tpp|tcc)$/i;
+  const C_EXT_RE   = /\.c$/i;
+  const a = path.dirname(callerFile).split(/[\\/]/);
+  const b = path.dirname(cand.file).split(/[\\/]/);
+  let i = 0;
+  while (i < a.length && i < b.length && normalizeFsPath(a[i]) === normalizeFsPath(b[i])) i++;
+  // 共有しない部分だけを見る(ワークスペース自体が build/ 配下にあっても誤判定しない)
+  const excluded = b.slice(i).some(seg => EXCLUDE_DIRS.has(seg)) ? 1 : 0;
+  const dist     = (a.length - i) + (b.length - i);
+  const mismatch = ((C_EXT_RE.test(callerFile) && CPP_EXT_RE.test(cand.file)) ||
+                    (CPP_EXT_RE.test(callerFile) && C_EXT_RE.test(cand.file))) ? 1 : 0;
+  return [excluded, dist, mismatch];
+}
+
+function pickBestCandidate(candidates: GtagEntry[], callerFile: string): GtagEntry {
+  const funcs = candidates.filter(c => c.isFunc);
+  const pool  = funcs.length > 0 ? funcs : candidates;
+  const ranked = pool.map((c, idx) => ({ c, idx, r: candidateRank(callerFile, c) }));
+  ranked.sort((x, y) =>
+    (x.r[0] - y.r[0]) || (x.r[1] - y.r[1]) || (x.r[2] - y.r[2]) || (x.idx - y.idx));
+  return ranked[0].c;
+}
+
 function resolveCallee(
   candidates: GtagEntry[] | undefined,
-  callerFile: string
+  callerFile: string,
+  uncertain?: UncertainResolution[],
 ): GtagEntry | undefined {
   if (!candidates?.length) return undefined;
-  return candidates.find(c => c.file === callerFile && c.isFunc)
-      ?? candidates.find(c => c.isFunc)
-      ?? candidates[0];
+  const exact = candidates.find(c => c.file === callerFile && c.isFunc);
+  if (exact) return exact;
+  const picked = pickBestCandidate(candidates, callerFile);
+  if (uncertain) {
+    const distinctFiles = new Set(candidates.map(c => c.file));
+    if (distinctFiles.size > 1) uncertain.push({ name: picked.name, callerFile, candidates, picked });
+  }
+  return picked;
 }
 
 
@@ -603,6 +849,7 @@ async function buildEdgesGlobalRx(
   endPct       = 75,
   errs:        string[] = [],
   wsRoots?:    string[],
+  uncertain?:  UncertainResolution[],
 ): Promise<Set<string>> {
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
   const edgeSet = new Set<string>();
@@ -611,12 +858,19 @@ async function buildEdgesGlobalRx(
     .filter(([, entries]) => entries.some(e => e.isFunc))
     .map(([name]) => name);
 
-  const patterns    = buildPatternBatches(funcNames);
+  const { patterns, skipped } = buildPatternBatches(funcNames);
   const totalGroups = Math.ceil(patterns.length / GLOBAL_RX_PARALLEL);
+  if (skipped > 0) errs.push(
+    `[gtags] Skipped ${skipped} identifier(s) too long for GNU GLOBAL pattern matching. ` +
+    'Call edges for these functions may be missing from the graph.');
 
   // 同一エラーを集約するための一時セット（GNU GLOBAL < 5.0 で -e 未サポートの場合など
   // 全バッチが同じエラーになる場合に重複を防ぐ）
   const errorMessages = new Set<string>();
+  // #1修正: sanitizeToAnyWsRoot が null を返した(=空白入りフォルダ名等でパスが
+  // 千切れて復元できなかった)件数。runGlobalXAll(collectGtags 経由の初回タグ収集)
+  // にしか無かった警告を、この下方向エッジ構築経路にも用意する。
+  let droppedRefCount = 0;
 
   for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     checkCancellation(token);
@@ -657,9 +911,16 @@ async function buildEdgesGlobalRx(
         const calleeName = parts[0];
         const refLine    = parseInt(parts[1], 10);
         if (!calleeName || isNaN(refLine)) continue;
+        // N2修正: この参照行自体が calleeName の宣言(前方宣言・クラス内メンバ宣言等)
+        // であれば、呼び出しとしては数えない。
+        if (isDeclarationRef(parts.slice(3).join(' '), calleeName)) continue;
         const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots);
         // normalizeFsPath を通した正規化済みパスで比較（macOS/Windows の大文字小文字・区切り文字の差異を吸収）
-        if (!refFile || !callerFiles.has(normalizeFsPath(refFile))) continue;
+        // #1修正: refFile が null になるのは「空白入りフォルダ名等でパスが解決できなかった」
+        // という異常系であり、callerFiles に含まれないだけの正常な絞り込み(他ファイルからの参照)
+        // とは区別してカウントする。
+        if (!refFile) { droppedRefCount++; continue; }
+        if (!callerFiles.has(normalizeFsPath(refFile))) continue;
         const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
         if (!fileScopeEntry) continue;
         const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
@@ -670,7 +931,7 @@ async function buildEdgesGlobalRx(
         if (!callerEntry) continue;
         // resolveCallee のフォールバックで別ファイルのエントリが返った場合はスキップする
         if (callerEntry.file !== refFile) continue;
-        const calleeEntry = resolveCallee(tags.get(calleeName), refFile);
+        const calleeEntry = resolveCallee(tags.get(calleeName), refFile, uncertain);
         if (!calleeEntry?.isFunc) continue;
         const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, calleeName, calleeEntry.line);
         if (!calleeScope) continue;
@@ -685,6 +946,9 @@ async function buildEdgesGlobalRx(
   }
   // ループ外でまとめて push（ループ内で都度 push すると同一エラーが N 件になる）
   for (const msg of errorMessages) errs.push(msg);
+  if (droppedRefCount > 0) errs.push(
+    `[gtags] Skipped ${droppedRefCount} reference(s) whose file path could not be resolved ` +
+    '(likely a folder name containing spaces). Some caller edges may be missing from the graph.');
   return edgeSet;
 }
 
@@ -723,6 +987,7 @@ interface GtagsBfsDownFullOpts {
   nodes:      Map<string, GraphNode>;
   edgeSet:    Set<string>;
   errs:       string[];
+  uncertain:  UncertainResolution[];
   tags:       Map<string, GtagEntry[]>;
   scopeMap:   Map<string, ScopeMapEntry>;
   lineCache:  Map<string, string[]>;
@@ -737,7 +1002,7 @@ interface GtagsBfsDownFullOpts {
 
 /** gtags 下方向 BFS（全量キャッシュ版）。extractCallsFromLines + resolveCallee で展開する。 */
 async function gtagsBfsDownFull(opts: GtagsBfsDownFullOpts): Promise<void> {
-  const { nodes, edgeSet, tags, scopeMap, lineCache, currentFile, startItems, maxHops, token, pct, pctRange } = opts;
+  const { nodes, edgeSet, tags, scopeMap, lineCache, currentFile, startItems, maxHops, token, pct, pctRange, uncertain } = opts;
   const knownTags = new Set(tags.keys());
   type QItem = { name: string; entry: GtagEntry; scope: ScopeEntry; hop: number };
   const queue:   QItem[]      = startItems.map(s => ({ ...s, hop: 0 }));
@@ -752,7 +1017,7 @@ async function gtagsBfsDownFull(opts: GtagsBfsDownFullOpts): Promise<void> {
     pct.bfsQ(pctRange[0], pctRange[1], visited, { length: queue.length - qi });
     if (maxHops !== undefined && hop >= maxHops) continue;
     for (const callee of extractCallsFromLines(lines, scope.start, scope.end, name, knownTags)) {
-      const calleeEntry = resolveCallee(tags.get(callee), entry.file);
+      const calleeEntry = resolveCallee(tags.get(callee), entry.file, uncertain);
       if (!calleeEntry?.isFunc) continue;
       const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
       if (!calleeScope) continue;
@@ -768,6 +1033,7 @@ interface GtagsBfsUpFullOpts {
   nodes:      Map<string, GraphNode>;
   edgeSet:    Set<string>;
   errs:       string[];
+  uncertain:  UncertainResolution[];
   tags:       Map<string, GtagEntry[]>;
   scopeMap:   Map<string, ScopeMapEntry>;
   wsRoot:     string;
@@ -782,7 +1048,7 @@ interface GtagsBfsUpFullOpts {
 
 /** gtags 上方向 BFS (全量キャッシュ版)。level-by-level + runGlobalRxBatch で遡る。 */
 async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
-  const { nodes, edgeSet, errs, tags, scopeMap, wsRoot, wsRoots, currentFile, startItems, maxHops, token, pct, pctRange } = opts;
+  const { nodes, edgeSet, errs, tags, scopeMap, wsRoot, wsRoots, currentFile, startItems, maxHops, token, pct, pctRange, uncertain } = opts;
   const upQueued = new Set<string>(startItems.map(s => s.calleeId));
   let upCurrentLevel = [...startItems];
   let hop = 0;
@@ -795,8 +1061,11 @@ async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
       // tags.get(funcName)?.find(...) は同名関数が複数ファイルにある場合に
       // 別ファイルを返すことがあり、正当な caller を誤ってスキップしてしまう。
       const { file: calleeFile } = parseGtagsNodeId(calleeId);
-      for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+      for (const { refFile, refLine, srcLine } of refMap.get(funcName) ?? []) {
         checkCancellation(token);
+        // N2修正: この参照が funcName 自身の宣言(前方宣言等)であれば、
+        // 呼び出し元として数えない(呼び出し元でなく単なる宣言のため)。
+        if (isDeclarationRef(srcLine, funcName)) continue;
         const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
         if (!fileScopeEntry) continue;
         const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
@@ -812,6 +1081,14 @@ async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
         // resolveCallee のフォールバックで別ファイルのエントリが返ると
         // 孤立エッジが生まれるためスキップする。
         if (callerEntry.file !== refFile) continue;
+        // refFile 側から funcName を実際に解決した結果が、今展開中の calleeFile と
+        // 一致するかを確認する。同名関数が複数ファイルに存在する場合(static 関数の
+        // 重複)、refFile は自分自身のファイル内の同名関数を呼んでいるだけの可能性が
+        // あるため、ここで検証しないと無関係な同名関数同士が誤って繋がってしまう
+        // (例: clone が 20 ファイルにある場合、mod_005.c の呼び出しが
+        //  mod_099.c の clone への着信として誤集計されるバグがあった)。
+        const trueTarget = resolveCallee(tags.get(funcName), refFile, uncertain);
+        if (!trueTarget || normalizeFsPath(trueTarget.file) !== normalizeFsPath(calleeFile)) continue;
         const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
         edgeSet.add(`${callerId}|||${calleeId}`);
         if (!nodes.has(callerId)) nodes.set(callerId, gtagsEntryToNode(callerScope.name, callerEntry, callerScope, currentFile));
@@ -830,6 +1107,7 @@ interface GtagsBfsDownLazyOpts {
   nodes:       Map<string, GraphNode>;
   edgeSet:     Set<string>;
   errs:        string[];
+  uncertain:   UncertainResolution[];
   startEntry:  { name: string; entry: GtagEntry; scope: ScopeEntry };
   tagCache:    Map<string, GtagEntry[]>;
   scopeCache:  Map<string, ScopeMapEntry>;
@@ -837,7 +1115,7 @@ interface GtagsBfsDownLazyOpts {
   wsRoot:      string;
   wsRoots:     string[]; // マルチルート対応
   currentFile: string;
-  maxHops:     number;
+  maxHops?:    number;
   token?:      vscode.CancellationToken;
   pct:         Pct;
   pctRange:    [number, number];
@@ -848,7 +1126,7 @@ interface GtagsBfsDownLazyOpts {
  * visited（処理完了）と queued（投入済み）を分離してサイクルによる二重処理を防ぐ。
  */
 async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
-  const { nodes, edgeSet, errs, startEntry, tagCache, scopeCache, lineCache, wsRoot, wsRoots, currentFile, maxHops, token, pct, pctRange } = opts;
+  const { nodes, edgeSet, errs, startEntry, tagCache, scopeCache, lineCache, wsRoot, wsRoots, currentFile, maxHops, token, pct, pctRange, uncertain } = opts;
   const startNodeId = makeGtagsNodeId(startEntry.entry.file, startEntry.name, startEntry.entry.line);
   type Q = { name: string; entry: GtagEntry; scope: ScopeEntry; hop: number };
   const queue:   Q[]          = [{ ...startEntry, hop: 0 }];
@@ -864,8 +1142,11 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
     const lines = await getFileLinesAsync(entry.file, lineCache);
     nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
 
-    // maxHops 到達かどうかでキューに積むかノード登録のみかを切り替える
-    const expandQueue = hop < maxHops;
+    // N3修正: maxHops到達ノードの「その先のcallee」を登録だけ行っていたため、
+    // maxHops=1 でも2ホップ先まで表示される(LSP/gtagsBfsDownFullとズレる)バグがあった。
+    // hop >= maxHops の時点で、このノード自体は既に登録済み(978行目)なので、
+    // それより先は展開もノード登録も一切行わずスキップする。
+    if (maxHops !== undefined && hop >= maxHops) continue;
     const rawCandidates = extractCallsFromLines(lines, scope.start, scope.end, name);
     if (rawCandidates.size > 0) {
       const uncached = [...rawCandidates].filter(c => !tagCache.has(c));
@@ -876,10 +1157,9 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
       }
       const resolvedCallees: Array<{ callee: string; calleeEntry: GtagEntry }> = [];
       for (const callee of rawCandidates) {
-        const calleeEntry = resolveCallee(tagCache.get(callee), entry.file);
+        const calleeEntry = resolveCallee(tagCache.get(callee), entry.file, uncertain);
         if (calleeEntry?.isFunc) resolvedCallees.push({ callee, calleeEntry });
       }
-      // スコープを並列プリフェッチ（expandQueue=false でも callee ノード登録のために必要）
       await Promise.all([...new Set(resolvedCallees.map(c => c.calleeEntry.file))].map(f =>
         buildScopeForFileCached(f, wsRoot, scopeCache, lineCache, wsRoots)));
       for (const { callee, calleeEntry } of resolvedCallees) {
@@ -889,15 +1169,7 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
         if (!calleeScope) continue;
         const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
         edgeSet.add(`${nodeId}|||${calleeId}`);
-        if (expandQueue) {
-          // 通常展開: 未訪問の callee をキューに積む
-          if (!queued.has(calleeId)) { queued.add(calleeId); queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 }); }
-        } else {
-          // maxHops 到達: キューには積まずノード登録のみ
-          if (!nodes.has(calleeId)) {
-            nodes.set(calleeId, gtagsEntryToNode(callee, calleeEntry, calleeScope, currentFile));
-          }
-        }
+        if (!queued.has(calleeId)) { queued.add(calleeId); queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 }); }
       }
     }
     pct.bfsQ(pctRange[0], pctRange[1], queued, { length: queue.length - qi });
@@ -916,43 +1188,58 @@ async function runGlobalRxBatch(
   wsRoot:    string,
   errs:      string[] = [],
   wsRoots?:  string[],
-): Promise<Map<string, Array<{ refFile: string; refLine: number }>>> {
-  const result = new Map<string, Array<{ refFile: string; refLine: number }>>();
+): Promise<Map<string, Array<{ refFile: string; refLine: number; srcLine: string }>>> {
+  const result = new Map<string, Array<{ refFile: string; refLine: number; srcLine: string }>>();
   for (const n of funcNames) result.set(n, []);
   if (funcNames.length === 0) return result;
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
-  const patterns = buildPatternBatches(funcNames);
+  const { patterns, skipped } = buildPatternBatches(funcNames);
+  if (skipped > 0) errs.push(
+    `[gtags] Skipped ${skipped} identifier(s) too long for GNU GLOBAL pattern matching. ` +
+    'Call edges for these functions may be missing from the graph.');
   const errorMessages = new Set<string>();
-  // GLOBAL_RX_PARALLEL 個ずつ逐次バッチ実行（全パターン同時起動によるリソース枯渇を防ぐ）
-  for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
-    await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
-      let stdout = '';
-      try {
-        ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
-          cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
-        }));
-      } catch (e) {
-        const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
-        const msg = ex instanceof Error ? ex.message : String(ex);
-        if (ex.killed || msg.includes('cancel')) return;
-        errorMessages.add(`global -rx: ${msg.split('\n')[0]}`);
-        return;
-      }
-      for (const raw of stdout.split('\n')) {
-        const parts = raw.trim().split(/\s+/);
-        if (parts.length < 3) continue;
-        const name    = parts[0];
-        const refLine = parseInt(parts[1], 10);
-        if (!name || isNaN(refLine)) continue;
-        // name にセパレータ文字が含まれる場合はスキップ
-        if (name.includes('\x00') || name.includes('|||')) continue;
-        const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots);
-        if (!refFile) continue;
-        result.get(name)?.push({ refFile, refLine });
-      }
-    }));
+  // #1修正: buildEdgesGlobalRx と同じ理由(sanitizeToAnyWsRoot が null を返すケースの警告)。
+  // この関数は File/Workspace/Path-Through Graph の上方向(caller) BFS 全てで使われる
+  // 共通経路のため、ここで警告できれば効果範囲が広い。
+  let droppedRefCount = 0;
+  // マルチルート対応: GNU GLOBAL は cwd 直下の GTAGS/GRTAGS/GPATH しか検索しないため、
+  // effectiveRoots の各 root を cwd に切り替えて個別に検索し、結果を同じ result にマージする。
+  // (buildEdgesGlobalRx の呼び出し元ループと同じ考え方を、この関数内部に持ち込んだもの)
+  for (const root of effectiveRoots) {
+    // GLOBAL_RX_PARALLEL 個ずつ逐次バッチ実行（全パターン同時起動によるリソース枯渇を防ぐ）
+    for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
+      await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
+        let stdout = '';
+        try {
+          ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
+            cwd: root, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
+          }));
+        } catch (e) {
+          const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
+          const msg = ex instanceof Error ? ex.message : String(ex);
+          if (ex.killed || msg.includes('cancel')) return;
+          errorMessages.add(`global -rx: ${msg.split('\n')[0]}`);
+          return;
+        }
+        for (const raw of stdout.split('\n')) {
+          const parts = raw.trim().split(/\s+/);
+          if (parts.length < 3) continue;
+          const name    = parts[0];
+          const refLine = parseInt(parts[1], 10);
+          if (!name || isNaN(refLine)) continue;
+          // name にセパレータ文字が含まれる場合はスキップ
+          if (name.includes('\x00') || name.includes('|||')) continue;
+          const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots);
+          if (!refFile) { droppedRefCount++; continue; }
+          result.get(name)?.push({ refFile, refLine, srcLine: parts.slice(3).join(' ') });
+        }
+      }));
+    }
   }
   for (const msg of errorMessages) errs.push(msg);
+  if (droppedRefCount > 0) errs.push(
+    `[gtags] Skipped ${droppedRefCount} reference(s) whose file path could not be resolved ` +
+    '(likely a folder name containing spaces). Some caller edges may be missing from the graph.');
   return result;
 }
 
@@ -970,27 +1257,41 @@ const MAX_PATTERN_LENGTH = 400;
  * MAX_PATTERN_LENGTH を超えないよう動的分割する。
  * runGlobalXNames と runGlobalRxBatch の両方で共用する。
  */
-function buildPatternBatches(names: string[]): string[] {
-  if (names.length === 0) return [];
+interface PatternBatchResult {
+  patterns: string[];
+  /** MAX_PATTERN_LENGTH を超えるため無視された識別子の数(N6修正: 呼び出し元で警告するため)。 */
+  skipped:  number;
+}
+
+function buildPatternBatches(names: string[]): PatternBatchResult {
+  if (names.length === 0) return { patterns: [], skipped: 0 };
   const batches: string[] = [];
   let batch: string[] = [];
   const WRAPPER_LEN = 4; // '^(' + ')$'
   let len = WRAPPER_LEN;
+  let skipped = 0;
 
   for (const name of names) {
     const escaped = escapeRegexForGlobal(name);
     // C++ のテンプレート特殊化など極端に長い関数名で buildPatternBatches が停止しなくなる問題を防ぐ。
-    if (WRAPPER_LEN + escaped.length > MAX_PATTERN_LENGTH) continue;
-    const add = (batch.length > 0 ? 1 : 0) + escaped.length; // 1 = '|' セパレータ
-    if (len + add > MAX_PATTERN_LENGTH && batch.length > 0) {
+    // N6修正: 以前はここで無警告のまま continue していたため、スキップされた関数だけ
+    // 一括検索(global -rx/-x)の対象から外れ、原因不明の「孤立ノード」に見えていた。
+    if (WRAPPER_LEN + escaped.length > MAX_PATTERN_LENGTH) { skipped++; continue; }
+    // 分割するかどうかの判定は「リセット前の batch」を基準に行う。
+    if (len + (batch.length > 0 ? 1 : 0) + escaped.length > MAX_PATTERN_LENGTH && batch.length > 0) {
       batches.push('^(' + batch.join('|') + ')$');
       batch = []; len = WRAPPER_LEN;
     }
+    // 微小修正: add は上の分割判定でリセットされた"後"の batch.length を基準に計算し直す。
+    // (以前はリセット前の batch.length>0 を使い回していたため、リセット直後で
+    //  セパレータ '|' が不要な最初の要素にも +1 してしまい、実際のバイト数より
+    //  1バイト大きく見積もっていた。安全側の誤差ではあるが、正確性のため修正)
+    const add = (batch.length > 0 ? 1 : 0) + escaped.length;
     batch.push(escaped);
     len += add;
   }
   if (batch.length > 0) batches.push('^(' + batch.join('|') + ')$');
-  return batches;
+  return { patterns: batches, skipped };
 }
 
 /**
@@ -1008,45 +1309,59 @@ async function runGlobalXNames(
   if (names.length === 0) return result;
 
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
-  const patterns = buildPatternBatches(names);
+  const { patterns, skipped } = buildPatternBatches(names);
+  if (skipped > 0) errs.push(
+    `[gtags] Skipped ${skipped} identifier(s) too long for GNU GLOBAL pattern matching. ` +
+    'These definitions may be missing from the graph.');
   const errorMessages = new Set<string>(); // 重複除去
+  // #1修正: buildEdgesGlobalRx / runGlobalRxBatch と同じ理由。この関数は
+  // Function Graph (BFS) コマンドが使う唯一のBFS経路であり、これまで
+  // ここだけ警告が一切無かった(README記載の警告が出ない直接の原因)。
+  let droppedRefCount = 0;
 
-  // GLOBAL_RX_PARALLEL 上限付きバッチ並列（runGlobalRxBatch と統一）
-  for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
-    await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
-      let stdout = '';
-      try {
-        ({ stdout } = await execFileAsync('global', ['-x', '-e', pattern], {
-          cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 30_000,
-        }));
-      } catch (e) {
-        const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
-        const msg = ex instanceof Error ? ex.message : String(ex);
-        if (ex.killed || msg.includes('cancel')) { return; }
-        errorMessages.add(`global -x: ${msg.split('\n')[0]}`);
-        return;
-      }
+  // マルチルート対応: runGlobalRxBatch と同様に effectiveRoots の各 root を cwd に切り替えて
+  // 個別に検索し、結果を同じ result にマージする。
+  for (const root of effectiveRoots) {
+    // GLOBAL_RX_PARALLEL 上限付きバッチ並列（runGlobalRxBatch と統一）
+    for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
+      await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
+        let stdout = '';
+        try {
+          ({ stdout } = await execFileAsync('global', ['-x', '-e', pattern], {
+            cwd: root, maxBuffer: 10 * 1024 * 1024, timeout: 30_000,
+          }));
+        } catch (e) {
+          const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
+          const msg = ex instanceof Error ? ex.message : String(ex);
+          if (ex.killed || msg.includes('cancel')) { return; }
+          errorMessages.add(`global -x: ${msg.split('\n')[0]}`);
+          return;
+        }
 
-      for (const raw of stdout.split('\n')) {
-        const trimmed = raw.trimEnd();
-        if (!trimmed) continue;
-        const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
-        if (!m) continue;
-        const [, name, lineStr, fileStr, sourceLine] = m;
-        const line = parseInt(lineStr, 10);
-        if (isNaN(line)) continue;
-        // name にセパレータが含まれる場合はスキップ
-        if (!name || name.includes('\x00') || name.includes('|||')) continue;
-        const file = sanitizeToAnyWsRoot(fileStr, effectiveRoots);
-        if (!file) continue;
-        const entry: GtagEntry = { name, file, line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
-        if (!result.has(name)) result.set(name, []);
-        result.get(name)!.push(entry);
-      }
-    }));
+        for (const raw of stdout.split('\n')) {
+          const trimmed = raw.trimEnd();
+          if (!trimmed) continue;
+          const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+          if (!m) continue;
+          const [, name, lineStr, fileStr, sourceLine] = m;
+          const line = parseInt(lineStr, 10);
+          if (isNaN(line)) continue;
+          // name にセパレータが含まれる場合はスキップ
+          if (!name || name.includes('\x00') || name.includes('|||')) continue;
+          const file = sanitizeToAnyWsRoot(fileStr, effectiveRoots);
+          if (!file) { droppedRefCount++; continue; }
+          const entry: GtagEntry = { name, file, line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
+          if (!result.has(name)) result.set(name, []);
+          result.get(name)!.push(entry);
+        }
+      }));
+    }
   }
 
   for (const msg of errorMessages) errs.push(msg);
+  if (droppedRefCount > 0) errs.push(
+    `[gtags] Skipped ${droppedRefCount} definition(s) whose file path could not be resolved ` +
+    '(likely a folder name containing spaces). Some functions may be missing from the graph.');
   return result;
 }
 
@@ -1123,6 +1438,7 @@ async function buildScopeForFileCached(
   // 正規化・非正規化の両キーで登録してヒット率を上げる
   scopeCache.set(norm, entry);
   scopeCache.set(file, entry);
+  touchScopeMap(scopeCache);
   return entry;
 }
 
@@ -1144,19 +1460,23 @@ export async function buildFileCallGraphGtags(
   { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
   pct.to(5);
   pct.report('📂 Loading tags...');
-  const { tags, lineCache, ambiguousNames, scopeMap } = await collectGtagsCached(wsRoot);
-  if (!tags.size) throw new Error('No tags found.\nPlease verify that gtags is installed and GTAGS exists.');
-  if (ambiguousNames.length > 0) {
-    const preview = ambiguousNames.slice(0, 5).join(', ');
-    const suffix  = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : '';
-    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
-  }
+  const { tags, lineCache, scopeMap, droppedRefCount } = await collectGtagsCached(wsRoot);
+  if (!tags.size) throw noTagsFoundError('No tags found.\nPlease verify that gtags is installed and GTAGS exists.', errs);
+  if (droppedRefCount > 0) errs.push(
+    `[gtags] Skipped ${droppedRefCount} reference(s) whose file path could not be resolved ` +
+    '(a common cause: a folder name containing a space is not supported by gtags parsing).');
+  const uncertain: UncertainResolution[] = [];
 
   const currentFile     = document.uri.fsPath;
   const currentFileNorm = normalizeFsPath(currentFile);
-  const currentLines    = document.getText().split('\n');
+  // B5修正: GTAGSの行番号はディスク上の(保存済みの)内容を基準にしている。
+  // 未保存のバッファ内容(document.getText())をそのまま使うと、保存前に行の追加/削除が
+  // あった場合に行番号がズレて関数本体の抽出位置が合わなくなり、呼び出しの取りこぼし/
+  // 誤検出につながる。GTAGSと常に整合するよう、常にディスクの内容を読む。
+  const currentLines    = await getFileLinesAsync(currentFile, lineCache);
   lineCache.set(currentFileNorm, currentLines);
-  lineCache.set(currentFile, currentLines);
+  if (document.isDirty) errs.push(
+    '[gtags] This file has unsaved changes; the analysis reflects the last saved version on disk.');
 
   const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
   const nodes      = new Map<string, GraphNode>();
@@ -1178,7 +1498,7 @@ export async function buildFileCallGraphGtags(
     const e = tags.get(scope.name)?.find(e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc);
     if (e) callerFiles.add(normalizeFsPath(e.file));
   }
-  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 20, 75, errs, wsRoots);
+  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 20, 75, errs, wsRoots, uncertain);
 
   // edgeSet の callee ノードを登録
   for (const edgeKey of edgeSet) {
@@ -1201,7 +1521,7 @@ export async function buildFileCallGraphGtags(
     const s = resolveCalleeScope(scopeMap, nf, nn, e.line);
     if (s) downStartItems.push({ name: nn, entry: e, scope: s });
   }
-  await gtagsBfsDownFull({ nodes, edgeSet, errs, tags, scopeMap, lineCache, wsRoot, currentFile, startItems: downStartItems, token, pct, pctRange: [75, 88] });
+  await gtagsBfsDownFull({ nodes, edgeSet, errs, uncertain, tags, scopeMap, lineCache, wsRoot, currentFile, startItems: downStartItems, token, pct, pctRange: [75, 88] });
 
   // 上方向 BFS (コアノードを起点に遡る)
   pct.to(88);
@@ -1209,7 +1529,11 @@ export async function buildFileCallGraphGtags(
     const entry = tags.get(scope.name)?.find(e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc);
     return entry ? [{ funcName: scope.name, calleeId: makeGtagsNodeId(entry.file, scope.name, entry.line) }] : [];
   });
-  await gtagsBfsUpFull({ nodes, edgeSet, errs, tags, scopeMap, wsRoot, wsRoots, currentFile, startItems: upStartItems, token, pct, pctRange: [88, 100] });
+  // B: このコマンドは tags/scopeMap が collectGtagsCached(wsRoot) 由来の単一root分しか
+  // 無いため、wsRoots(開いている全root)をそのまま渡すと他root分の global -rx が
+  // 実行されても scopeMap に無く必ず捨てられる無駄な呼び出しになる。単一rootに絞る。
+  await gtagsBfsUpFull({ nodes, edgeSet, errs, uncertain, tags, scopeMap, wsRoot, wsRoots: [wsRoot], currentFile, startItems: upStartItems, token, pct, pctRange: [88, 100] });
+  errs.push(...formatUncertainResolutions(uncertain));
 
   return {
     nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),
@@ -1218,7 +1542,7 @@ export async function buildFileCallGraphGtags(
 }
 
 export async function buildFunctionCallGraphGtags(
-  document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
+  document: vscode.TextDocument, position: vscode.Position, maxHops: number | undefined,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
@@ -1245,9 +1569,14 @@ export async function buildFunctionCallGraphGtags(
 
   const currentFile     = document.uri.fsPath;
   const currentFileNorm = normalizeFsPath(currentFile);
-  const currentLines    = document.getText().split('\n');
-  lineCache.set(currentFile, currentLines);
+  // B5修正: GTAGSの行番号はディスク上の(保存済みの)内容を基準にしている。
+  // 未保存のバッファ内容(document.getText())をそのまま使うと、保存前に行の追加/削除が
+  // あった場合に行番号がズレて関数本体の抽出位置が合わなくなり、呼び出しの取りこぼし/
+  // 誤検出につながる。GTAGSと常に整合するよう、常にディスクの内容を読む。
+  const currentLines    = await getFileLinesAsync(currentFile, lineCache);
   lineCache.set(currentFileNorm, currentLines);
+  if (document.isDirty) errs.push(
+    '[gtags] This file has unsaved changes; the analysis reflects the last saved version on disk.');
 
   // 起点関数を特定 (遅延ローディング)
   pct.to(5);
@@ -1266,13 +1595,15 @@ export async function buildFunctionCallGraphGtags(
 
   const nodes   = new Map<string, GraphNode>();
   const edgeSet = new Set<string>();
+  const uncertain: UncertainResolution[] = [];
 
   // 下方向 BFS のみ (遅延ローディング版)
   // LSP バックエンドの buildFunctionCallGraphLsp と挙動を統一する。
   // 双方向グラフが必要な場合は buildPathThroughCallGraphGtags を使用すること。
   pct.to(15);
   pct.report('⬇ Building callee graph...');
-  await gtagsBfsDownLazy({ nodes, edgeSet, errs, startEntry: { name: startScope.name, entry: startEntry, scope: startScope }, tagCache, scopeCache, lineCache, wsRoot, wsRoots, currentFile, maxHops, token, pct, pctRange: [15, 100] });
+  await gtagsBfsDownLazy({ nodes, edgeSet, errs, uncertain, startEntry: { name: startScope.name, entry: startEntry, scope: startScope }, tagCache, scopeCache, lineCache, wsRoot, wsRoots, currentFile, maxHops, token, pct, pctRange: [15, 100] });
+  errs.push(...formatUncertainResolutions(uncertain));
 
   return {
     nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),
@@ -1296,21 +1627,21 @@ async function collectWsTagsAndNodes(
     checkCancellation(token);
     pct.range(0, 20, ri, rootList.length);
     { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
-    let rootTags: Map<string, GtagEntry[]>, rootAmbiguous: string[], rootScopeMap: Map<string, ScopeMapEntry>;
+    let rootTags: Map<string, GtagEntry[]>, rootScopeMap: Map<string, ScopeMapEntry>;
     try {
       const r = await collectGtagsCached(wsRoot);
-      rootTags = r.tags; rootAmbiguous = r.ambiguousNames; rootScopeMap = r.scopeMap;
+      rootTags = r.tags; rootScopeMap = r.scopeMap;
+      if (r.droppedRefCount > 0) errs.push(
+        `[gtags] Skipped ${r.droppedRefCount} reference(s) in ${path.basename(wsRoot)} whose file path ` +
+        'could not be resolved (a common cause: a folder name containing a space is not supported by gtags parsing).');
     } catch (e) { errs.push(`[gtags] Failed to collect tags for ${wsRoot}: ${e}`); continue; }
     if (!rootTags.size) { errs.push(`[gtags] No tags found in ${wsRoot}. Run \`gtags\` in that folder.`); continue; }
-    if (rootAmbiguous.length > 0) {
-      const p = rootAmbiguous.slice(0, 5).join(', ');
-      errs.push(`[gtags] Duplicate names in ${path.basename(wsRoot)}: ${p}${rootAmbiguous.length > 5 ? ` (+${rootAmbiguous.length - 5})` : ''}`);
-    }
     for (const [name, entries] of rootTags) {
       if (!mergedTags.has(name)) mergedTags.set(name, []);
       mergedTags.get(name)!.push(...entries);
     }
     for (const [fp, entry] of rootScopeMap) mergedScopeMap.set(fp, entry);
+    touchScopeMap(mergedScopeMap);
     for (const uri of rootUris) {
       for (const scope of findScopeMapEntry(mergedScopeMap, uri.fsPath)?.list ?? []) {
         const entry = rootTags.get(scope.name)?.find(e => normalizeFsPath(e.file) === normalizeFsPath(uri.fsPath) && e.isFunc);
@@ -1335,24 +1666,42 @@ export async function buildWorkspaceCallGraphGtags(
   if (!uniqueUris.length) throw new Error('No C/C++ source files found.');
 
   const rootGroups = new Map<string, vscode.Uri[]>();
+  let outsideWorkspaceCount = 0;
   for (const uri of uniqueUris) {
+    // N6修正: getWorkspaceRootForFile はワークスペース未オープン時にファイルの
+    // 親ディレクトリへフォールバックするが、ワークスペースが開かれている場合でも
+    // 「対象ファイルがどのワークスペースフォルダにも属さない」ケースでは、
+    // 無関係な最初のワークスペースフォルダへ誤って割り当ててしまう
+    // (gtagsのDBが実際には存在しない場所に作られ、「No tags found」という
+    //  的外れなエラーになる)。vscode.workspace.getWorkspaceFolder で
+    // 実際にそのファイルを含むワークスペースフォルダかどうかを確認する。
+    if (!vscode.workspace.getWorkspaceFolder(uri)) { outsideWorkspaceCount++; continue; }
     const root = getWorkspaceRootForFile(uri);
     if (!root) continue;
     if (!rootGroups.has(root)) rootGroups.set(root, []);
     rootGroups.get(root)!.push(uri);
   }
-  if (!rootGroups.size) throw new Error('No workspace folder is open.');
+  if (!rootGroups.size) {
+    if (outsideWorkspaceCount > 0) {
+      throw new Error(
+        `None of the ${outsideWorkspaceCount} selected file(s) are inside an open workspace folder.\n` +
+        'gtags needs the analyzed files to be within a workspace folder ' +
+        '(File > Open Folder...), not just referenced from elsewhere.');
+    }
+    throw new Error('No workspace folder is open.');
+  }
 
   const pct      = new Pct(progress);
   const rootList = Array.from(rootGroups.entries());
   pct.to(0); checkCancellation(token);
 
   const { mergedTags, mergedScopeMap, nodes } = await collectWsTagsAndNodes(rootList, errs, pct, token);
-  if (!mergedTags.size) throw new Error('No tags found. Run `gtags` in each workspace root.');
+  if (!mergedTags.size) throw noTagsFoundError('No tags found. Run `gtags` in each workspace root.', errs);
 
   // ルートごとに global -rx でエッジ構築
   const edgeSet     = new Set<string>();
   const allWsRoots  = rootList.map(([root]) => root);
+  const uncertain: UncertainResolution[] = [];
   pct.to(20);
   checkCancellation(token);
   for (let ri = 0; ri < rootList.length; ri++) {
@@ -1363,7 +1712,7 @@ export async function buildWorkspaceCallGraphGtags(
     const rootCallerFiles = new Set<string>();
     for (const uri of rootUris) { rootCallerFiles.add(normalizeFsPath(uri.fsPath)); }
     const rootEdges = await buildEdgesGlobalRx(rootCallerFiles, mergedTags, mergedScopeMap, wsRoot, token, pct,
-      20 + Math.floor(ri * 70 / rootList.length), 20 + Math.floor((ri + 1) * 70 / rootList.length), errs, allWsRoots);
+      20 + Math.floor(ri * 70 / rootList.length), 20 + Math.floor((ri + 1) * 70 / rootList.length), errs, allWsRoots, uncertain);
     for (const e of rootEdges) edgeSet.add(e);
   }
 
@@ -1389,7 +1738,7 @@ export async function buildWorkspaceCallGraphGtags(
     const s = resolveCalleeScope(mergedScopeMap, nf, nn, e.line);
     if (s) downStartItems.push({ name: nn, entry: e, scope: s });
   }
-  await gtagsBfsDownFull({ nodes, edgeSet, errs, tags: mergedTags, scopeMap: mergedScopeMap, lineCache: bfsLineCache, wsRoot: rootList[0][0], currentFile: '', startItems: downStartItems, token, pct, pctRange: [90, 95] });
+  await gtagsBfsDownFull({ nodes, edgeSet, errs, uncertain, tags: mergedTags, scopeMap: mergedScopeMap, lineCache: bfsLineCache, wsRoot: rootList[0][0], currentFile: '', startItems: downStartItems, token, pct, pctRange: [90, 95] });
 
   // 上方向 BFS: 全登録ノードを起点として caller 方向を遡り上方向エッジを収集する。
   pct.to(95);
@@ -1399,7 +1748,8 @@ export async function buildWorkspaceCallGraphGtags(
     const { name: nn } = parseGtagsNodeId(nodeId);
     upStartItems.push({ funcName: nn, calleeId: nodeId });
   }
-  await gtagsBfsUpFull({ nodes, edgeSet, errs, tags: mergedTags, scopeMap: mergedScopeMap, wsRoot: rootList[0][0], wsRoots: allWsRootsForUp, currentFile: '', startItems: upStartItems, token, pct, pctRange: [95, 100] });
+  await gtagsBfsUpFull({ nodes, edgeSet, errs, uncertain, tags: mergedTags, scopeMap: mergedScopeMap, wsRoot: rootList[0][0], wsRoots: allWsRootsForUp, currentFile: '', startItems: upStartItems, token, pct, pctRange: [95, 100] });
+  errs.push(...formatUncertainResolutions(uncertain));
 
   const label = uniqueUris.length === 1 ? path.basename(uniqueUris[0].fsPath) : `${uniqueUris.length} files`;
   return {
@@ -1409,7 +1759,7 @@ export async function buildWorkspaceCallGraphGtags(
 }
 
 export async function buildPathThroughCallGraphGtags(
-  document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
+  document: vscode.TextDocument, position: vscode.Position, maxHops: number | undefined,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
@@ -1417,7 +1767,6 @@ export async function buildPathThroughCallGraphGtags(
   const errs: string[] = [];
   const wsRoot  = getWorkspaceRootForFile(document.uri);
   if (!wsRoot) throw new Error('No workspace folder is open.');
-  const wsRoots = getWorkspaceRoots(document.uri);
   const pct = new Pct(progress);
 
   pct.to(0);
@@ -1425,19 +1774,23 @@ export async function buildPathThroughCallGraphGtags(
   { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
   pct.to(5);
   pct.report('📂 Loading tags...');
-  const { tags, lineCache, ambiguousNames, scopeMap } = await collectGtagsCached(wsRoot);
-  if (!tags.size) throw new Error('No tags found.');
-  if (ambiguousNames.length > 0) {
-    const preview = ambiguousNames.slice(0, 5).join(', ');
-    const suffix  = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : '';
-    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
-  }
+  const { tags, lineCache, scopeMap, droppedRefCount } = await collectGtagsCached(wsRoot);
+  if (!tags.size) throw noTagsFoundError('No tags found.', errs);
+  if (droppedRefCount > 0) errs.push(
+    `[gtags] Skipped ${droppedRefCount} reference(s) whose file path could not be resolved ` +
+    '(a common cause: a folder name containing a space is not supported by gtags parsing).');
+  const uncertain: UncertainResolution[] = [];
 
   const currentFile     = document.uri.fsPath;
   const currentFileNorm = normalizeFsPath(currentFile);
-  const currentLines    = document.getText().split('\n');
-  lineCache.set(currentFile, currentLines);
+  // B5修正: GTAGSの行番号はディスク上の(保存済みの)内容を基準にしている。
+  // 未保存のバッファ内容(document.getText())をそのまま使うと、保存前に行の追加/削除が
+  // あった場合に行番号がズレて関数本体の抽出位置が合わなくなり、呼び出しの取りこぼし/
+  // 誤検出につながる。GTAGSと常に整合するよう、常にディスクの内容を読む。
+  const currentLines    = await getFileLinesAsync(currentFile, lineCache);
   lineCache.set(currentFileNorm, currentLines);
+  if (document.isDirty) errs.push(
+    '[gtags] This file has unsaved changes; the analysis reflects the last saved version on disk.');
 
   // 起点関数を特定
   const cursorLine = position.line + 1;
@@ -1455,16 +1808,19 @@ export async function buildPathThroughCallGraphGtags(
 
   // 下方向 BFS
   pct.to(20);
-  await gtagsBfsDownFull({ nodes, edgeSet, errs, tags, scopeMap, lineCache, wsRoot, currentFile,
+  await gtagsBfsDownFull({ nodes, edgeSet, errs, uncertain, tags, scopeMap, lineCache, wsRoot, currentFile,
     startItems: [{ name: startScope.name, entry: startEntry, scope: startScope }],
     maxHops, token, pct, pctRange: [20, 55] });
 
   // 上方向 BFS
   pct.to(55);
   const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
-  await gtagsBfsUpFull({ nodes, edgeSet, errs, tags, scopeMap, wsRoot, wsRoots, currentFile,
+  // B: このコマンドも tags/scopeMap が単一root分しか無いため wsRoots を [wsRoot] に絞る
+  // (理由は buildFileCallGraphGtags と同様)。
+  await gtagsBfsUpFull({ nodes, edgeSet, errs, uncertain, tags, scopeMap, wsRoot, wsRoots: [wsRoot], currentFile,
     startItems: [{ funcName: startScope.name, calleeId: startNodeId }],
     maxHops, token, pct, pctRange: [55, 100] });
+  errs.push(...formatUncertainResolutions(uncertain));
 
   return {
     nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),

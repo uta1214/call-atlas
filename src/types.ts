@@ -13,7 +13,10 @@ export interface GraphNode {
   file:          string;
   line:          number;
   scopeEnd?:     number;   // 遅延読み込み用スコープ終端行 (1-indexed)
-  source?:       string;   // スタンドアロン HTML 生成時のみ設定
+  source?:       string;   // 予約フィールド(現状どの生成経路でも設定されない)。
+                            // WebViewでは requestSource でノードごとに遅延取得する。
+                            // スタンドアロンHTML書き出し版はソースを埋め込まないため、
+                            // 「Show source panel」は無効化して表示している。
   isCurrentFile: boolean;
 }
 
@@ -25,6 +28,15 @@ export interface GraphData {
   fileName:    string;
   buildTimeMs: number;
   errors:      string[];
+  /** どちらのバックエンドで解決されたか。callGraphBuilder.ts が resolveBackend() 後に設定する。
+   *  保存ファイル名の lsp_/gtags_ プレフィックス判定に使用。 */
+  backend?:    'lsp' | 'gtags';
+  /** どのコマンドで作られたか。extension.ts の buildAndOutput() が設定する。
+   *  保存ファイル名の末尾(省略系サフィックス)判定に使用。 */
+  kind?:       'file' | 'func' | 'path' | 'workspace' | 'folder';
+  /** 保存ファイル名に使う「対象名」(ワークスペース名/フォルダ名/ファイル名/関数名)。
+   *  extension.ts の buildAndOutput() が設定する。 */
+  subject?:    string;
 }
 
 export type Backend = 'lsp' | 'gtags' | 'auto';
